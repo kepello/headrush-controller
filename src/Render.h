@@ -110,23 +110,28 @@ inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
     gfx.pushSprite(0, 0);
 }
 
-// Boot splash: firmware version (prominent) plus the device ID.
-inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion) {
+// Boot splash: firmware version (prominent), device ID, and a boot counter
+// (a persistence probe — it should increment each power cycle if NVS persists).
+inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion, int bootCount) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
-    gfx.drawString("HeadRush", CX, CY - 46);
+    gfx.drawString("HeadRush", CX, CY - 50);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.setTextSize(4);
     char fw[12];
     snprintf(fw, sizeof(fw), "fw %d", fwVersion);
-    gfx.drawString(fw, CX, CY);
+    gfx.drawString(fw, CX, CY - 6);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
     char id[16];
     snprintf(id, sizeof(id), "ID %d", deviceId);
-    gfx.drawString(id, CX, CY + 46);
+    gfx.drawString(id, CX, CY + 38);
+    gfx.setTextSize(1);
+    char bc[16];
+    snprintf(bc, sizeof(bc), "boot %d", bootCount);
+    gfx.drawString(bc, CX, CY + 72);
     gfx.pushSprite(0, 0);
 }
 

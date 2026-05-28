@@ -14,6 +14,7 @@
 #include <NetworkClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
+#include <nvs_flash.h>
 #include <AiEsp32RotaryEncoder.h>
 #include "HeadRushClient.h"
 #include "Normalize.h"
@@ -123,6 +124,7 @@ UiMode uiMode = UI_GAUGE;
 // both set on-device in config mode and persisted in NVS.
 volatile int deviceId = 1;
 int paramIndex = 0;
+int bootCount = 0;  // persistence probe shown on the boot splash
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
 enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM };
 ConfigState cfg = CFG_NONE;
@@ -358,14 +360,25 @@ void setup() {
     delay(500);
     Serial.printf("\n=== HeadRush Controller — Stage 1B (fw %d) ===\n", FW_VERSION);
 
+    // Ensure NVS is healthy. If the partition is in a bad/old state, the core
+    // may not have reformatted it, making Preferences writes succeed in-session
+    // but never persist. Reformat once on that error, then re-init.
+    esp_err_t nvsErr = nvs_flash_init();
+    if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvsErr = nvs_flash_init();
+    }
+    Serial.printf("nvs_flash_init: %d\n", (int)nvsErr);
+
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 1);
     paramIndex = prefs.getInt("param", 0);
+    bootCount = prefs.getInt("bootn", 0);
     prefs.end();
     if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
     activeBinding = &PARAM_CATALOG[paramIndex];
-    Serial.printf("Device ID: %d, param %s (%s.%s)\n", deviceId,
-                  activeBinding->label, activeBinding->path, activeBinding->prop);
+    { Preferences p; p.begin("hrctrl", false); p.putInt("bootn", bootCount + 1); p.end(); }  // probe
+    Serial.printf("Device ID: %d, param %s, boot #%d\n", deviceId, activeBinding->label, bootCount);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
@@ -376,7 +389,7 @@ void setup() {
     if (!canvas.createSprite(240, 240)) Serial.println("canvas alloc FAILED");
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    Render::drawBootInfo(canvas, deviceId, FW_VERSION);
+    Render::drawBootInfo(canvas, deviceId, FW_VERSION, bootCount);
 
     encoder.begin();
     encoder.setup(encoderISR);
