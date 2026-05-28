@@ -140,21 +140,21 @@ inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char
     gfx.pushSprite(0, 0);
 }
 
-// Config-mode menu. Four items; `sel` is the highlighted index.
+// Config-mode menu. Five items; `sel` is the highlighted index.
 inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* paramLabel, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
 
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
-    gfx.drawString("CONFIG", CX, 30);
+    gfx.drawString("CONFIG", CX, 24);
 
     char idbuf[20], pbuf[24];
     snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
     snprintf(pbuf, sizeof(pbuf), "Param: %s", paramLabel);
-    const char* labels[4] = { idbuf, pbuf, "Update firmware", "Exit" };
-    for (int i = 0; i < 4; ++i) {
-        int y = 76 + i * 32;
+    const char* labels[5] = { idbuf, pbuf, "WiFi", "Update firmware", "Exit" };
+    for (int i = 0; i < 5; ++i) {
+        int y = 58 + i * 30;
         bool s = (i == sel);
         gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
         gfx.setTextSize(2);
@@ -166,7 +166,7 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
     snprintf(fwbuf, sizeof(fwbuf), "fw %d", fwVersion);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
-    gfx.drawString(fwbuf, CX, 206);
+    gfx.drawString(fwbuf, CX, 212);
     gfx.pushSprite(0, 0);
 }
 
@@ -189,6 +189,39 @@ inline void drawParamPick(LGFX_Sprite& gfx, const ContinuousBinding* catalog, in
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
     gfx.drawString("turn = change   click = save", CX, 208);
+    gfx.pushSprite(0, 0);
+}
+
+// WiFi network picker: spinner over scanned SSIDs (or "no networks").
+inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, int sel) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString("SELECT WIFI", CX, 36);
+    if (count <= 0) {
+        gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+        gfx.drawString("no networks", CX, CY);
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.setTextSize(1);
+        gfx.drawString("click = rescan", CX, 208);
+        gfx.pushSprite(0, 0);
+        return;
+    }
+    int prev = (sel - 1 + count) % count;
+    int next = (sel + 1) % count;
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString(ssids[prev], CX, CY - 38);
+    gfx.drawString(ssids[next], CX, CY + 38);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString(ssids[sel], CX, CY);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    char foot[28];
+    snprintf(foot, sizeof(foot), "%d/%d   click = select", sel + 1, count);
+    gfx.drawString(foot, CX, 208);
     gfx.pushSprite(0, 0);
 }
 

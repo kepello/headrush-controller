@@ -155,11 +155,21 @@ static int signalLevel(int rssi) {   // 0..4 bars
 volatile int deviceId = 1;
 int paramIndex = 0;
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
-enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM };
+enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM, CFG_WIFI };
 ConfigState cfg = CFG_NONE;
 int menuIndex = 0;
 int editIdValue = 1;
 int editParamValue = 0;
+
+// On-device WiFi setup: the net task scans, the UI picks. Scan results are char
+// buffers (not String) to keep cross-core sharing simple. Stage 2 adds the
+// password entry + connect using selectedSSID.
+volatile bool scanRequested = false;  // UI -> net: run a scan
+volatile bool scanDone = false;       // net -> UI: results ready
+volatile int  scanCount = 0;
+char scanSSIDs[16][33];
+int  wifiPickIndex = 0;
+char selectedSSID[33] = "";
 
 struct WifiCreds { String ssid; String psk; String hostOverride; };
 
@@ -385,6 +395,29 @@ bool syncClockFromHttp() {
     return true;
 }
 
+// Scan for WiFi networks (net task only). Fills scanSSIDs/scanCount, deduped,
+// then sets scanDone. Works whether or not we're currently connected.
+void doWifiScan() {
+    scanDone = false;
+    WiFi.mode(WIFI_STA);
+    int n = WiFi.scanNetworks();
+    int k = 0;
+    for (int i = 0; i < n && k < 16; ++i) {
+        String s = WiFi.SSID(i);
+        if (s.length() == 0) continue;
+        bool dup = false;
+        for (int j = 0; j < k; ++j) if (s.equalsIgnoreCase(scanSSIDs[j])) { dup = true; break; }
+        if (dup) continue;
+        strncpy(scanSSIDs[k], s.c_str(), 32);
+        scanSSIDs[k][32] = 0;
+        k++;
+    }
+    WiFi.scanDelete();
+    scanCount = k;
+    scanDone = true;
+    Serial.printf("[wifi] scan: %d networks\n", k);
+}
+
 void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
@@ -424,6 +457,7 @@ void netTask(void*) {
 
     uint32_t lastWriteMs = 0;
     while (true) {
+        if (scanRequested) { scanRequested = false; doWifiScan(); }  // works offline too
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
@@ -553,15 +587,47 @@ void loop() {
         if (clicked) {
             if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
             else if (menuIndex == 1) { editParamValue = paramIndex; cfg = CFG_EDIT_PARAM; Render::drawParamPick(canvas, PARAM_CATALOG, PARAM_COUNT, editParamValue); }
-            else if (menuIndex == 2) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+            else if (menuIndex == 2) { cfg = CFG_WIFI; wifiPickIndex = 0; scanDone = false; scanRequested = true; }  // scan starts
+            else if (menuIndex == 3) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) {
-            menuIndex = (int)(((menuIndex + edelta) % 4 + 4) % 4);
+            menuIndex = (int)(((menuIndex + edelta) % 5 + 5) % 5);
             Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
         }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- WiFi network picker (Stage 1b: scan + pick; password/connect = Stage 2) ---
+    if (cfg == CFG_WIFI) {
+        static bool shownScanning = false;
+        static int  shownPick = -2;
+        if (!scanDone) {  // scan in progress
+            if (!shownScanning) { shownScanning = true; shownPick = -2; Render::drawSplash(canvas, deviceId, FW_VERSION, "scanning WiFi"); }
+            vTaskDelay(pdMS_TO_TICKS(30));
+            return;
+        }
+        shownScanning = false;
+        if (longPress) { cfg = CFG_MENU; shownPick = -2; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (scanCount <= 0) {  // no networks — click to rescan
+            if (clicked) { scanDone = false; scanRequested = true; shownPick = -2; vTaskDelay(pdMS_TO_TICKS(5)); return; }
+            if (shownPick != -1) { shownPick = -1; Render::drawWifiPicker(canvas, scanSSIDs, 0, 0); }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            return;
+        }
+        if (clicked) {
+            strncpy(selectedSSID, scanSSIDs[wifiPickIndex], sizeof(selectedSSID)); selectedSSID[32] = 0;
+            Serial.printf("[wifi] picked %s\n", selectedSSID);
+            cfg = CFG_MENU; shownPick = -2;  // Stage 2 will go to password entry instead
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) wifiPickIndex = (int)(((wifiPickIndex + edelta) % scanCount + scanCount) % scanCount);
+        if (shownPick != wifiPickIndex) { shownPick = wifiPickIndex; Render::drawWifiPicker(canvas, scanSSIDs, scanCount, wifiPickIndex); }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
