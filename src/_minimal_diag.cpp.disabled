@@ -1,0 +1,24 @@
+// Minimal diagnostic for ruling out config issues. Renamed to .disabled so PIO
+// ignores it during normal builds; rename to .cpp and rebuild to use it.
+// Does no PSRAM, no WiFi, no SPI, no I2C. Just Serial + GPIO + LED blink.
+//
+// If THIS doesn't print "tick" over Serial, the issue is platformio.ini / SDK
+// config, not our application code.
+
+#include <Arduino.h>
+
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("\n=== MINIMAL DIAG ===");
+    Serial.printf("ESP chip rev: %d, cores: %d, sketch size: %u\n",
+                  ESP.getChipRevision(), ESP.getChipCores(), ESP.getSketchSize());
+    pinMode(40, OUTPUT);  // POWER_LIGHT_PIN
+}
+
+void loop() {
+    static int n = 0;
+    Serial.printf("tick %d\n", n++);
+    digitalWrite(40, n & 1);
+    delay(500);
+}

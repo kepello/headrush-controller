@@ -1,0 +1,55 @@
+name: release
+
+# Tag a commit `vN` (integer build number, e.g. v1, v2) and push the tag:
+#   git tag v1 && git push origin v1
+# This builds the firmware with -DFW_VERSION=N and publishes firmware.bin +
+# version.json as assets on a GitHub Release. Devices pull from
+#   https://github.com/<owner>/<repo>/releases/latest/download/version.json
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # required for the GITHUB_TOKEN to create the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build firmware (inject version from tag)
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          PLATFORMIO_BUILD_FLAGS="-DFW_VERSION=$VER" pio run -e crowpanel_128
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp .pio/build/crowpanel_128/firmware.bin dist/firmware.bin
+          VER="${GITHUB_REF_NAME#v}"
+          printf '{\n  "version": %s,\n  "url": "https://github.com/%s/releases/latest/download/firmware.bin",\n  "notes": "%s"\n}\n' \
+            "$VER" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > dist/version.json
+          echo "--- version.json ---"; cat dist/version.json
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/firmware.bin
+            dist/version.json
