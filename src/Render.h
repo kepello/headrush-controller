@@ -42,11 +42,16 @@ inline float frac(const ContinuousBinding& cb, float v) {
 // Draw the full arc gauge for a continuous binding. Background arc + colored
 // foreground proportional to value. Center: big value text + small unit. Top:
 // short label. Call from the UI task only.
-inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot) {
+inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot, int sigLevel) {
     gfx.fillScreen(COLOR_BG);
 
-    // Connection-status dot near the top (color set by the caller).
-    gfx.fillCircle(CX, CY - 82, 7, statusDot);
+    // Top indicators: connection-status dot (color set by caller) + WiFi signal bars.
+    gfx.fillCircle(CX - 24, CY - 80, 6, statusDot);
+    for (int b = 0; b < 4; ++b) {
+        int bh = 4 + b * 3;                       // bar heights 4,7,10,13
+        gfx.fillRect(CX - 6 + b * 7, (CY - 73) - bh, 4, bh,
+                     b < sigLevel ? COLOR_VALUE : COLOR_DIM);
+    }
 
     // Background arc (full sweep, dim).
     gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, ARC_START_DEG, ARC_END_DEG, COLOR_DIM);

@@ -139,6 +139,16 @@ static uint16_t statusColor(ConnStatus s) {
         default:            return 0x8410;  // grey — booting
     }
 }
+volatile int wifiRssi = 0;   // dBm, updated by the net task when online (0 = unknown)
+int lastSignalLevel = -1;    // UI redraw tracking
+static int signalLevel(int rssi) {   // 0..4 bars
+    if (rssi == 0)    return 0;
+    if (rssi >= -60)  return 4;
+    if (rssi >= -68)  return 3;
+    if (rssi >= -76)  return 2;
+    if (rssi >= -84)  return 1;
+    return 0;
+}
 
 // Per-device identity (1..16) and chosen parameter (index into PARAM_CATALOG),
 // both set on-device in config mode and persisted in NVS.
@@ -282,35 +292,43 @@ void setupOTA() {
     Serial.printf("[ota] ready at %s.local\n", gHostname.c_str());
 }
 
-// Pull update: fetch version.json from GitHub Releases, and if it advertises a
-// build number higher than ours, download + flash firmware.bin. Runs in the net
-// task. On a successful flash the device reboots (never returns from update()).
+bool syncClockFromHttp();  // defined below; used to self-heal the clock before TLS
+
 // Pull update: fetch version.json from GitHub Releases over verified TLS (needs
-// the clock set — see NTP sync in netTask), and if it advertises a build number
-// higher than ours, download + flash firmware.bin. Runs in the net task; a
-// successful flash reboots into the new image. Status shows on the UI.
+// the clock set — re-syncs it here with retries), and if it advertises a build
+// number higher than ours, download + flash firmware.bin. Runs in the net task;
+// a successful flash reboots into the new image. Status shows on the UI.
 void checkForUpdate(const char* reason) {
     snprintf(otaStatusMsg, sizeof(otaStatusMsg), "checking...");
     otaChecking = true;
 
-    NetworkClientSecure client;
-    client.setCACert(GITHUB_ROOTS);  // pinned GitHub roots (the IDF bundle wouldn't validate)
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(10000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub 302s to its CDN
-    if (!http.begin(client, FW_MANIFEST_URL)) {
-        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "begin failed");
-        delay(2500); otaChecking = false; return;
+    // Verified TLS needs a real clock; re-sync (with retries) if the boot sync
+    // didn't take. NTP is often blocked and a one-shot HTTPS Date can miss.
+    for (int i = 0; i < 3 && time(nullptr) < 1700000000; ++i)
+        if (!syncClockFromHttp()) delay(800);
+
+    // Fetch the manifest, retrying transient TLS/network failures.
+    int code = 0;
+    String body;
+    for (int attempt = 0; attempt < 3 && code != HTTP_CODE_OK; ++attempt) {
+        NetworkClientSecure client;
+        client.setCACert(GITHUB_ROOTS);  // pinned GitHub roots (the IDF bundle wouldn't validate)
+        HTTPClient http;
+        http.setConnectTimeout(10000);
+        http.setTimeout(10000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub 302s to its CDN
+        if (http.begin(client, FW_MANIFEST_URL)) {
+            http.addHeader("User-Agent", "headrush-controller");
+            code = http.GET();
+            if (code == HTTP_CODE_OK) body = http.getString();
+            http.end();
+        }
+        if (code != HTTP_CODE_OK) delay(700);
     }
-    http.addHeader("User-Agent", "headrush-controller");
-    int code = http.GET();
     if (code != HTTP_CODE_OK) {
         snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed (%d)", code);
-        http.end(); delay(2500); otaChecking = false; return;
+        delay(2500); otaChecking = false; return;
     }
-    String body = http.getString();
-    http.end();
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) {
@@ -328,12 +346,14 @@ void checkForUpdate(const char* reason) {
     otaPercent = 0;
     otaActive = true;       // UI switches to the progress ring
     otaChecking = false;
+    NetworkClientSecure dlClient;
+    dlClient.setCACert(GITHUB_ROOTS);
     httpUpdate.rebootOnUpdate(true);
     httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     httpUpdate.onProgress([](int cur, int total) {
         otaPercent = total ? (int)((cur * 100L) / total) : 0;
     });
-    t_httpUpdate_return r = httpUpdate.update(client, url);
+    t_httpUpdate_return r = httpUpdate.update(dlClient, url);
     // Only reached if the update did NOT succeed (success reboots into the new image).
     otaActive = false;
     snprintf(otaStatusMsg, sizeof(otaStatusMsg), "update failed %d", (int)r);
@@ -409,7 +429,8 @@ void netTask(void*) {
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
             if (rebindRequested) { rebindRequested = false; primeInitialValue(); }  // new param picked
             hr.loop();
-            if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; }
+            if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; wifiRssi = 0; }
+            else { static uint32_t lastRssiMs = 0; if (millis() - lastRssiMs > 1000) { lastRssiMs = millis(); wifiRssi = WiFi.RSSI(); } }
             bool dirty = false;
             float v = 0;
             portENTER_CRITICAL(&stateMux);
@@ -618,10 +639,12 @@ void loop() {
     v = sharedValue;
     portEXIT_CRITICAL(&stateMux);
     uint16_t sc = statusColor(connStatus);
-    if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f || sc != lastStatusColor) {
-        Render::drawContinuous(canvas, *activeBinding, v, sc);
+    int sl = signalLevel(wifiRssi);
+    if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f || sc != lastStatusColor || sl != lastSignalLevel) {
+        Render::drawContinuous(canvas, *activeBinding, v, sc, sl);
         lastRenderedValue = v;
         lastStatusColor = sc;
+        lastSignalLevel = sl;
     }
 
     vTaskDelay(pdMS_TO_TICKS(2));
