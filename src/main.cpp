@@ -283,8 +283,9 @@ void checkForUpdate(const char* reason) {
     http.addHeader("User-Agent", "headrush-controller");
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed %d", code);
-        http.end(); delay(2500); otaChecking = false; return;
+        time_t now = time(nullptr); struct tm ti; gmtime_r(&now, &ti);
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "fail %d y%d", code, ti.tm_year + 1900);
+        http.end(); delay(3000); otaChecking = false; return;
     }
     String body = http.getString();
     http.end();
@@ -317,6 +318,31 @@ void checkForUpdate(const char* reason) {
     otaChecking = true; delay(3000); otaChecking = false;
 }
 
+// Set the system clock from an HTTPS Date header. NTP (UDP/123) is blocked on
+// some networks while TCP/443 to GitHub works — and verified TLS needs a real
+// clock to check cert validity dates. Reads only the header; trusts nothing.
+bool syncClockFromHttp() {
+    NetworkClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    if (!http.begin(client, "https://github.com/")) return false;
+    const char* keys[] = { "Date" };
+    http.collectHeaders(keys, 1);
+    http.sendRequest("HEAD");
+    String date = http.header("Date");
+    http.end();
+    struct tm tm = {};
+    if (date.length() < 20 || !strptime(date.c_str(), "%a, %d %b %Y %H:%M:%S", &tm)) return false;
+    setenv("TZ", "UTC0", 1); tzset();
+    time_t t = mktime(&tm);
+    if (t < 1700000000) return false;
+    struct timeval tv = { t, 0 };
+    settimeofday(&tv, nullptr);
+    return true;
+}
+
 void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
@@ -324,11 +350,12 @@ void netTask(void*) {
     WifiCreds c = loadCreds();
     if (!connectWifi(c)) { vTaskDelete(NULL); return; }
 
-    // Sync the clock via NTP. TLS verifies the server cert's validity dates, and
-    // the ESP32 boots at epoch 1970 — without a real time, every cert looks
-    // "not yet valid" and the handshake fails. Needed before any verified HTTPS.
+    // Set the clock for verified TLS (cert date checks). Try NTP briefly, then
+    // fall back to the HTTPS Date header (NTP/UDP is blocked on some networks
+    // while TCP/443 works). Without a real clock, every cert looks not-yet-valid.
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-    for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 8000; ) delay(200);
+    for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 4000; ) delay(200);
+    if (time(nullptr) < 1700000000) syncClockFromHttp();
     Serial.printf("[net] time = %ld\n", (long)time(nullptr));
 
     String host = resolveHost(c);
