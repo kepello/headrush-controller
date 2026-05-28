@@ -104,6 +104,14 @@ int lastRenderedOtaPercent = -1;
 enum UiMode { UI_GAUGE, UI_CHECKING, UI_UPDATING };
 UiMode uiMode = UI_GAUGE;
 
+// Per-device identity (1..16), set on-device in config mode, persisted in NVS.
+volatile int deviceId = 1;
+// Config mode is a UI-task-local modal state, entered by a long (~5s) press.
+enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID };
+ConfigState cfg = CFG_NONE;
+int menuIndex = 0;
+int editIdValue = 1;
+
 struct WifiCreds { String ssid; String psk; String hostOverride; };
 
 WifiCreds loadCreds() {
@@ -120,6 +128,14 @@ WifiCreds loadCreds() {
     c.hostOverride = prefs.getString("host", "");
     prefs.end();
     return c;
+}
+
+void saveDeviceId(int id) {
+    Preferences p;
+    p.begin("hrctrl", false);
+    p.putInt("devid", id);
+    p.end();
+    Serial.printf("Device ID saved: %d\n", id);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -206,6 +222,11 @@ void setupOTA() {
     Serial.printf("[ota] ready at %s.local\n", gHostname.c_str());
 }
 
+// Full Mozilla CA bundle, embedded in the IDF mbedtls library (esp_crt_bundle).
+// Referenced directly so TLS verification needs no generated/committed bundle.
+extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t x509_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
+
 // Pull update: fetch version.json from GitHub Releases, and if it advertises a
 // build number higher than ours, download + flash firmware.bin. Runs in the net
 // task. On a successful flash the device reboots (never returns from update()).
@@ -214,10 +235,10 @@ void checkForUpdate(const char* reason) {
     Serial.printf("[upd] checking (%s)\n", reason);
 
     NetworkClientSecure client;
-    // NOTE: skips server-certificate verification. Acceptable on a trusted LAN,
-    // but for firmware this should be hardened — embed a CA bundle and call
-    // client.setCACertBundle(...) so a MITM can't serve forged firmware.
-    client.setInsecure();
+    // Verify the server cert against the full Mozilla CA bundle. Covers both
+    // github.com (USERTrust root) and the release CDN (ISRG/Let's Encrypt root),
+    // and survives CA rotation — so a MITM can't serve forged firmware.
+    client.setCACertBundle(x509_crt_bundle_start, x509_crt_bundle_end - x509_crt_bundle_start);
 
     HTTPClient http;
     http.setConnectTimeout(8000);
@@ -307,13 +328,20 @@ void setup() {
     delay(500);
     Serial.printf("\n=== HeadRush Controller — Stage 1B (fw %d) ===\n", FW_VERSION);
 
+    prefs.begin("hrctrl", true);
+    deviceId = prefs.getInt("devid", 1);
+    prefs.end();
+    Serial.printf("Device ID: %d\n", deviceId);
+
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
 
     gfx.init();
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    Render::drawBootScreen(gfx, "booting...");
+    char boot[24];
+    snprintf(boot, sizeof(boot), "ID %d  booting...", deviceId);
+    Render::drawBootScreen(gfx, boot);
 
     encoder.begin();
     encoder.setup(encoderISR);
@@ -326,9 +354,9 @@ void setup() {
 }
 
 void loop() {
-    // Update overlays. The net task may be blocked downloading/flashing on its
-    // own core; this task keeps running and shows progress. Redraw only on a
-    // mode change or a percent change so the screen doesn't flicker.
+    // Net-driven overlays take priority over everything, including config mode:
+    // a download/flash may be running on the other core. Redraw only on a mode
+    // or percent change so the screen doesn't flicker.
     if (otaActive) {  // downloading + flashing
         if (uiMode != UI_UPDATING) { uiMode = UI_UPDATING; lastRenderedOtaPercent = -1; }
         int p = otaPercent;
@@ -341,24 +369,81 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
-    if (uiMode != UI_GAUGE) { uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }  // force gauge redraw on return
+    if (uiMode != UI_GAUGE && cfg == CFG_NONE) { uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
 
-    // Hold the encoder button ~1.5s to manually check for an update.
-    static uint32_t btnDownSince = 0;
-    static bool btnFired = false;
-    if (encoder.isEncoderButtonDown()) {
-        if (btnDownSince == 0) { btnDownSince = millis(); btnFired = false; }
-        else if (!btnFired && millis() - btnDownSince >= 1500) { otaCheckRequested = true; btnFired = true; }
-    } else {
-        btnDownSince = 0; btnFired = false;
+    // --- Read input once: a short click, a ~5s long-press, and the turn delta ---
+    bool clicked = false, longPress = false;
+    {
+        static uint32_t down = 0;
+        static bool fired = false;
+        if (encoder.isEncoderButtonDown()) {
+            if (down == 0) { down = millis(); fired = false; }
+            else if (!fired && millis() - down >= 5000) { longPress = true; fired = true; }
+        } else {
+            if (down != 0 && !fired) {
+                uint32_t held = millis() - down;
+                if (held >= 40 && held < 5000) clicked = true;  // debounced short press
+            }
+            down = 0;
+        }
     }
-
+    long edelta = 0;
     if (encoder.encoderChanged()) {
         long v = encoder.readEncoder();
-        long delta = (v - lastEncoderValue) * ENCODER_SIGN;
+        edelta = (v - lastEncoderValue) * ENCODER_SIGN;
         lastEncoderValue = v;
+    }
+
+    // --- Config menu ---
+    if (cfg == CFG_MENU) {
+        if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (clicked) {
+            if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(gfx, editIdValue); }
+            else if (menuIndex == 1) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+            else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            menuIndex = (int)(((menuIndex + edelta) % 3 + 3) % 3);
+            Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Device-ID editor ---
+    if (cfg == CFG_EDIT_ID) {
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (clicked) {
+            deviceId = editIdValue;
+            saveDeviceId(editIdValue);
+            cfg = CFG_MENU;
+            Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            editIdValue += (int)edelta;
+            if (editIdValue < 1) editIdValue = 1;
+            if (editIdValue > 16) editIdValue = 16;
+            Render::drawConfigIdEdit(gfx, editIdValue);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Normal gauge mode ---
+    if (longPress) {  // enter config
+        cfg = CFG_MENU;
+        menuIndex = 0;
+        Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+    if (edelta != 0) {
         portENTER_CRITICAL(&stateMux);
-        float nv = sharedValue + delta * activeBinding->step;
+        float nv = sharedValue + edelta * activeBinding->step;
         if (nv < activeBinding->dispMin) nv = activeBinding->dispMin;
         if (nv > activeBinding->dispMax) nv = activeBinding->dispMax;
         sharedValue = nv;

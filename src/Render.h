@@ -105,6 +105,51 @@ inline void drawOTAProgress(CrowPanelLGFX& gfx, int percent) {
     gfx.drawString(buf, CX, CY + 4);
 }
 
+// Config-mode menu. Three fixed items; `sel` is the highlighted index.
+inline void drawConfigMenu(CrowPanelLGFX& gfx, int sel, int deviceId, int fwVersion) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString("CONFIG", CX, 36);
+
+    char idbuf[20];
+    snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
+    const char* labels[3] = { idbuf, "Update firmware", "Exit" };
+    for (int i = 0; i < 3; ++i) {
+        int y = 92 + i * 36;
+        bool s = (i == sel);
+        gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
+        gfx.setTextSize(2);
+        gfx.drawString(labels[i], CX, y);
+        if (s) gfx.drawString(">", CX - 96, y);
+    }
+
+    char fwbuf[16];
+    snprintf(fwbuf, sizeof(fwbuf), "fw %d", fwVersion);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString(fwbuf, CX, 208);
+}
+
+// Device-ID editor: big number, turn to change, click to save.
+inline void drawConfigIdEdit(CrowPanelLGFX& gfx, int value) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString("DEVICE ID", CX, CY - 52);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setTextSize(7);
+    char b[8];
+    snprintf(b, sizeof(b), "%d", value);
+    gfx.drawString(b, CX, CY + 2);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString("turn = change   click = save", CX, CY + 58);
+}
+
 inline void drawBootScreen(CrowPanelLGFX& gfx, const char* msg) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
