@@ -110,9 +110,9 @@ inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
     gfx.pushSprite(0, 0);
 }
 
-// Boot splash: firmware version (prominent), device ID, and a boot counter
-// (a persistence probe — it should increment each power cycle if NVS persists).
-inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion, int bootCount) {
+// Boot splash: firmware version (prominent), device ID, and an NVS probe line
+// (b<boot> i<init> o<open> w<wrote> r<readback>) for diagnosing persistence.
+inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char* diag) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
@@ -127,11 +127,9 @@ inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion, int boot
     gfx.setTextSize(2);
     char id[16];
     snprintf(id, sizeof(id), "ID %d", deviceId);
-    gfx.drawString(id, CX, CY + 38);
+    gfx.drawString(id, CX, CY + 36);
     gfx.setTextSize(1);
-    char bc[16];
-    snprintf(bc, sizeof(bc), "boot %d", bootCount);
-    gfx.drawString(bc, CX, CY + 72);
+    gfx.drawString(diag, CX, CY + 72);
     gfx.pushSprite(0, 0);
 }
 
