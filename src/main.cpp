@@ -144,6 +144,16 @@ WifiCreds loadCreds() {
         c.ssid = WIFI_SSID;
         c.psk = WIFI_PSK;
         c.hostOverride = HEADRUSH_HOST_OVERRIDE;
+        // Seed NVS so OTA-delivered (CI) firmware — which has no compiled-in
+        // secrets.h — can still join WiFi. NVS survives OTA, so a single local
+        // flash provisions the unit for all future over-the-air updates.
+        Preferences p;
+        if (p.begin("hrctrl", false)) {
+            p.putString("ssid", c.ssid);
+            p.putString("psk", c.psk);
+            p.putString("host", c.hostOverride);
+            p.end();
+        }
         return c;
     }
     prefs.begin("hrctrl", true);
