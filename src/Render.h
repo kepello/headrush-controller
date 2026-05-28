@@ -42,8 +42,11 @@ inline float frac(const ContinuousBinding& cb, float v) {
 // Draw the full arc gauge for a continuous binding. Background arc + colored
 // foreground proportional to value. Center: big value text + small unit. Top:
 // short label. Call from the UI task only.
-inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value) {
+inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot) {
     gfx.fillScreen(COLOR_BG);
+
+    // Connection-status dot near the top (color set by the caller).
+    gfx.fillCircle(CX, CY - 82, 7, statusDot);
 
     // Background arc (full sweep, dim).
     gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, ARC_START_DEG, ARC_END_DEG, COLOR_DIM);

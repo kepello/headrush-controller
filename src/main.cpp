@@ -125,6 +125,21 @@ UiMode uiMode = UI_GAUGE;
 volatile bool bootComplete = false;   // net task sets true after its boot sequence
 char bootMsg[40] = "starting";        // boot-phase status shown on the splash
 
+// On-screen connection indicator: a colored dot the net task drives.
+enum ConnStatus { CS_BOOTING, CS_CONNECTING, CS_WIFI, CS_HEADRUSH, CS_WIFI_ERR, CS_HR_LOST };
+volatile ConnStatus connStatus = CS_BOOTING;
+uint16_t lastStatusColor = 1;  // != any real color, forces first draw
+static uint16_t statusColor(ConnStatus s) {
+    switch (s) {
+        case CS_CONNECTING: return 0xFFE0;  // yellow — joining WiFi
+        case CS_WIFI:       return 0x07FF;  // cyan — WiFi up, Prime not yet
+        case CS_HEADRUSH:   return 0x07E0;  // green — Prime connected
+        case CS_WIFI_ERR:   return 0xF800;  // red — WiFi error / disconnected
+        case CS_HR_LOST:    return 0xFD20;  // orange — Prime disconnected
+        default:            return 0x8410;  // grey — booting
+    }
+}
+
 // Per-device identity (1..16) and chosen parameter (index into PARAM_CATALOG),
 // both set on-device in config mode and persisted in NVS.
 volatile int deviceId = 1;
@@ -354,51 +369,64 @@ void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
     Serial.printf("[net] hostname: %s.local\n", gHostname.c_str());
-    snprintf(bootMsg, sizeof(bootMsg), "connecting");
     WifiCreds c = loadCreds();
-    if (!connectWifi(c)) { snprintf(bootMsg, sizeof(bootMsg), "no WiFi"); bootComplete = true; vTaskDelete(NULL); return; }
+    snprintf(bootMsg, sizeof(bootMsg), "connecting");
+    connStatus = CS_CONNECTING;
+    bool online = connectWifi(c);
 
-    // Set the clock for verified TLS (cert date checks). Try NTP briefly, then
-    // fall back to the HTTPS Date header (NTP/UDP is blocked on some networks
-    // while TCP/443 works). Without a real clock, every cert looks not-yet-valid.
-    snprintf(bootMsg, sizeof(bootMsg), "setting clock");
-    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-    for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 4000; ) delay(200);
-    if (time(nullptr) < 1700000000) syncClockFromHttp();
-    Serial.printf("[net] time = %ld\n", (long)time(nullptr));
+    if (online) {
+        connStatus = CS_WIFI;
+        // Set the clock for verified TLS (cert date checks). Try NTP briefly,
+        // then fall back to the HTTPS Date header (NTP/UDP is blocked on some
+        // networks while TCP/443 works). No real clock = certs look not-yet-valid.
+        snprintf(bootMsg, sizeof(bootMsg), "setting clock");
+        configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+        for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 4000; ) delay(200);
+        if (time(nullptr) < 1700000000) syncClockFromHttp();
+        Serial.printf("[net] time = %ld\n", (long)time(nullptr));
 
-    String host = resolveHost(c);
-    snprintf(bootMsg, sizeof(bootMsg), "linking Prime");
-    hr.onValueChanged(onValueChanged);
-    hr.onConnection([](bool up) { Serial.printf("WS %s\n", up ? "connected" : "disconnected"); });
-    hr.begin(host);
-    primeInitialValue();
-    setupOTA();
-    if (FW_VERSION > 0) checkForUpdate("boot");  // dev builds (fw 0) skip auto-update
-    bootComplete = true;
+        String host = resolveHost(c);
+        snprintf(bootMsg, sizeof(bootMsg), "linking Prime");
+        hr.onValueChanged(onValueChanged);
+        hr.onConnection([](bool up) {
+            connStatus = up ? CS_HEADRUSH : CS_HR_LOST;
+            Serial.printf("WS %s\n", up ? "connected" : "disconnected");
+        });
+        hr.begin(host);
+        primeInitialValue();
+        setupOTA();
+        if (FW_VERSION > 0) checkForUpdate("boot");  // dev builds (fw 0) skip auto-update
+    } else {
+        connStatus = CS_WIFI_ERR;
+        snprintf(bootMsg, sizeof(bootMsg), "WiFi failed");
+    }
+    bootComplete = true;  // never delete the task — stay alive so the UI keeps working
 
     uint32_t lastWriteMs = 0;
     while (true) {
-        ArduinoOTA.handle();  // blocks here for the duration of a push update
-        if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-        if (rebindRequested) { rebindRequested = false; primeInitialValue(); }  // new param picked
-        hr.loop();
-        bool dirty = false;
-        float v = 0;
-        portENTER_CRITICAL(&stateMux);
-        if (pendingWriteValid && millis() - lastWriteMs >= WRITE_THROTTLE_MS) {
-            v = pendingWriteValue;
-            pendingWriteValid = false;
-            dirty = true;
+        if (online) {
+            ArduinoOTA.handle();  // blocks here for the duration of a push update
+            if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
+            if (rebindRequested) { rebindRequested = false; primeInitialValue(); }  // new param picked
+            hr.loop();
+            if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; }
+            bool dirty = false;
+            float v = 0;
+            portENTER_CRITICAL(&stateMux);
+            if (pendingWriteValid && millis() - lastWriteMs >= WRITE_THROTTLE_MS) {
+                v = pendingWriteValue;
+                pendingWriteValid = false;
+                dirty = true;
+            }
+            portEXIT_CRITICAL(&stateMux);
+            if (dirty) {
+                lastWriteMs = millis();
+                float wire = HR::displayToWire(v, activeBinding->dispMin, activeBinding->dispMax);
+                if (!hr.setProperty(activeBinding->path, activeBinding->prop, wire))
+                    Serial.println("[net] write FAIL");
+            }
         }
-        portEXIT_CRITICAL(&stateMux);
-        if (dirty) {
-            lastWriteMs = millis();
-            float wire = HR::displayToWire(v, activeBinding->dispMin, activeBinding->dispMax);
-            if (!hr.setProperty(activeBinding->path, activeBinding->prop, wire))
-                Serial.println("[net] write FAIL");
-        }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(online ? 2 : 50));
     }
 }
 
@@ -589,9 +617,11 @@ void loop() {
     portENTER_CRITICAL(&stateMux);
     v = sharedValue;
     portEXIT_CRITICAL(&stateMux);
-    if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f) {
-        Render::drawContinuous(canvas, *activeBinding, v);
+    uint16_t sc = statusColor(connStatus);
+    if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f || sc != lastStatusColor) {
+        Render::drawContinuous(canvas, *activeBinding, v, sc);
         lastRenderedValue = v;
+        lastStatusColor = sc;
     }
 
     vTaskDelay(pdMS_TO_TICKS(2));
