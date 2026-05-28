@@ -52,26 +52,27 @@
 
 // Per-device role table. The device's configured ID (1..16, see config mode)
 // selects one entry, so all units run the same firmware but control different
-// parameters. IDs beyond the table fall back to entry 0 (Output). All targets
-// are rig-independent globals, so they work regardless of the loaded rig.
-// Ranges/formats taken from the device's own API schema (headrush-api-tree.json).
+// parameters. IDs beyond the table fall back to entry 0 (Output). Output/Input
+// are rig-independent; COMP/REVERB write to effect blocks that must be present
+// in the loaded rig (test mapping). Ranges/formats are from the device's own
+// API schema (headrush-api-tree.json).
 const ContinuousBinding DEVICE_BINDINGS[] = {
     // ID 1 — master output level
     { .label = "OUTPUT", .path = "/Evil/Engine/Patch/Output", .prop = "RigVolume",
       .dispMin = -60.0f, .dispMax = +36.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
       .zones = { {-30.0f, 0x6B7F}, {-6.0f, 0x07E0}, {+6.0f, 0xFFE0}, {+36.0f, 0xF800} }, .zoneCount = 4 },
-    // ID 2 — global tempo
-    { .label = "TEMPO", .path = "/Evil/Engine/Tempo", .prop = "Tempo",
-      .dispMin = 30.0f, .dispMax = 240.0f, .step = 1.0f, .format = "%.0f", .unit = "BPM",
-      .zones = { {240.0f, 0x07E0} }, .zoneCount = 1 },
-    // ID 3 — stereo width
-    { .label = "WIDTH", .path = "/Evil/Engine/Patch/Output", .prop = "RigWidth",
+    // ID 2 — guitar input level
+    { .label = "INPUT", .path = "/Evil/Engine/Patch/Input", .prop = "InputGain",
+      .dispMin = -60.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
+      .zones = { {-12.0f, 0x6B7F}, {0.0f, 0x07E0}, {+6.0f, 0xFFE0}, {+12.0f, 0xF800} }, .zoneCount = 4 },
+    // ID 3 — compression amount (requires the Gray Comp block in the loaded rig)
+    { .label = "COMP", .path = "/Evil/Engine/Patch/Gray_Comp", .prop = "Sustain",
       .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
       .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
-    // ID 4 — global EQ high band (treble)
-    { .label = "TREBLE", .path = "/Evil/Engine/GlobalEQMain", .prop = "Gain4",
-      .dispMin = -12.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
-      .zones = { {-3.0f, 0x6B7F}, {+3.0f, 0x07E0}, {+12.0f, 0xFFE0} }, .zoneCount = 3 },
+    // ID 4 — reverb mix (requires the AIR Reverb block in the loaded rig)
+    { .label = "REVERB", .path = "/Evil/Engine/Patch/AIR_Reverb", .prop = "Mix",
+      .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
+      .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
 };
 const int DEVICE_BINDING_COUNT = sizeof(DEVICE_BINDINGS) / sizeof(DEVICE_BINDINGS[0]);
 // Selected from deviceId in setup(), before the net task starts. Read-only after.
