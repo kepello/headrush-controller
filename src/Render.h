@@ -110,26 +110,23 @@ inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
     gfx.pushSprite(0, 0);
 }
 
-// Boot splash: firmware version (prominent), device ID, and an NVS probe line
-// (b<boot> i<init> o<open> w<wrote> r<readback>) for diagnosing persistence.
-inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char* diag) {
+// Boot splash: firmware version (prominent) plus the device ID.
+inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
-    gfx.drawString("HeadRush", CX, CY - 50);
+    gfx.drawString("HeadRush", CX, CY - 46);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.setTextSize(4);
     char fw[12];
     snprintf(fw, sizeof(fw), "fw %d", fwVersion);
-    gfx.drawString(fw, CX, CY - 6);
+    gfx.drawString(fw, CX, CY);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
     char id[16];
     snprintf(id, sizeof(id), "ID %d", deviceId);
-    gfx.drawString(id, CX, CY + 36);
-    gfx.setTextSize(1);
-    gfx.drawString(diag, CX, CY + 72);
+    gfx.drawString(id, CX, CY + 46);
     gfx.pushSprite(0, 0);
 }
 

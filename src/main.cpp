@@ -124,8 +124,6 @@ UiMode uiMode = UI_GAUGE;
 // both set on-device in config mode and persisted in NVS.
 volatile int deviceId = 1;
 int paramIndex = 0;
-int bootCount = 0;     // persistence probe shown on the boot splash
-char nvsDiag[48] = "";  // NVS probe results for the boot splash (serial is dead)
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
 enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM };
 ConfigState cfg = CFG_NONE;
@@ -364,33 +362,20 @@ void setup() {
     // Ensure NVS is healthy. If the partition is in a bad/old state, the core
     // may not have reformatted it, making Preferences writes succeed in-session
     // but never persist. Reformat once on that error, then re-init.
+    // Defensive: reformat NVS if it's ever in a bad/old state so settings persist.
     esp_err_t nvsErr = nvs_flash_init();
     if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
-        nvsErr = nvs_flash_init();
+        nvs_flash_init();
     }
 
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 1);
     paramIndex = prefs.getInt("param", 0);
-    bootCount = prefs.getInt("bootn", 0);
     prefs.end();
     if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
     activeBinding = &PARAM_CATALOG[paramIndex];
-
-    // NVS persistence probe: write bootn+1 with one handle, read back with a
-    // fresh one. Encoded on the boot splash as "b<boot> i<init> o<open> w<wrote> r<readback>".
-    Preferences pw;
-    bool openOk = pw.begin("hrctrl", false);
-    size_t wrote = pw.putInt("bootn", bootCount + 1);
-    pw.end();
-    Preferences pr;
-    pr.begin("hrctrl", true);
-    int rb = pr.getInt("bootn", -1);
-    pr.end();
-    snprintf(nvsDiag, sizeof(nvsDiag), "b%d i0x%X o%d w%u r%d",
-             bootCount, (unsigned)nvsErr, openOk ? 1 : 0, (unsigned)wrote, rb);
-    Serial.printf("NVS %s | param %s\n", nvsDiag, activeBinding->label);
+    Serial.printf("Device ID: %d, param %s\n", deviceId, activeBinding->label);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
@@ -401,7 +386,7 @@ void setup() {
     if (!canvas.createSprite(240, 240)) Serial.println("canvas alloc FAILED");
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    Render::drawBootInfo(canvas, deviceId, FW_VERSION, nvsDiag);
+    Render::drawBootInfo(canvas, deviceId, FW_VERSION);
 
     encoder.begin();
     encoder.setup(encoderISR);
@@ -414,9 +399,8 @@ void setup() {
 
     // Hold the boot splash long enough to read; the gauge would otherwise
     // overwrite it within a few ms once loop() starts. WiFi connects on the net
-    // task during this delay, so the wait isn't wasted. (Extended while the NVS
-    // diagnostic line is on the splash.)
-    delay(3000);
+    // task during this delay, so the wait isn't wasted.
+    delay(1200);
 }
 
 void loop() {
