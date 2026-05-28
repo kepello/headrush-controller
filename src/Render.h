@@ -2,6 +2,9 @@
 #include "Display.h"
 #include "Binding.h"
 
+// All draw functions render into an off-screen LGFX_Sprite (the `gfx` param) and
+// blit the finished frame in one pushSprite — so the screen never shows an
+// intermediate cleared state (flicker-free). Call only from the UI task.
 namespace Render {
 
 // Geometry. Arc sweeps from bottom-left around the top to bottom-right.
@@ -39,7 +42,7 @@ inline float frac(const ContinuousBinding& cb, float v) {
 // Draw the full arc gauge for a continuous binding. Background arc + colored
 // foreground proportional to value. Center: big value text + small unit. Top:
 // short label. Call from the UI task only.
-inline void drawContinuous(CrowPanelLGFX& gfx, const ContinuousBinding& cb, float value) {
+inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value) {
     gfx.fillScreen(COLOR_BG);
 
     // Background arc (full sweep, dim).
@@ -77,11 +80,12 @@ inline void drawContinuous(CrowPanelLGFX& gfx, const ContinuousBinding& cb, floa
         gfx.setTextSize(2);
         gfx.drawString(cb.unit, CX, CY + 44);
     }
+    gfx.pushSprite(0, 0);
 }
 
 // Full-screen OTA progress: a ring that fills with the update percentage and a
 // big "NN%" readout. Call from the UI task only (same as drawContinuous).
-inline void drawOTAProgress(CrowPanelLGFX& gfx, int percent) {
+inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     gfx.fillScreen(COLOR_BG);
@@ -103,10 +107,11 @@ inline void drawOTAProgress(CrowPanelLGFX& gfx, int percent) {
     char buf[8];
     snprintf(buf, sizeof(buf), "%d%%", percent);
     gfx.drawString(buf, CX, CY + 4);
+    gfx.pushSprite(0, 0);
 }
 
 // Boot splash: firmware version (prominent) plus the device ID.
-inline void drawBootInfo(CrowPanelLGFX& gfx, int deviceId, int fwVersion) {
+inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
@@ -122,10 +127,11 @@ inline void drawBootInfo(CrowPanelLGFX& gfx, int deviceId, int fwVersion) {
     char id[16];
     snprintf(id, sizeof(id), "ID %d", deviceId);
     gfx.drawString(id, CX, CY + 46);
+    gfx.pushSprite(0, 0);
 }
 
 // Config-mode menu. Four items; `sel` is the highlighted index.
-inline void drawConfigMenu(CrowPanelLGFX& gfx, int sel, int deviceId, const char* paramLabel, int fwVersion) {
+inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* paramLabel, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
 
@@ -151,10 +157,11 @@ inline void drawConfigMenu(CrowPanelLGFX& gfx, int sel, int deviceId, const char
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
     gfx.drawString(fwbuf, CX, 206);
+    gfx.pushSprite(0, 0);
 }
 
 // Parameter picker: spinner showing the highlighted entry with dimmed neighbors.
-inline void drawParamPick(CrowPanelLGFX& gfx, const ContinuousBinding* catalog, int count, int sel) {
+inline void drawParamPick(LGFX_Sprite& gfx, const ContinuousBinding* catalog, int count, int sel) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
@@ -172,10 +179,11 @@ inline void drawParamPick(CrowPanelLGFX& gfx, const ContinuousBinding* catalog, 
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
     gfx.drawString("turn = change   click = save", CX, 208);
+    gfx.pushSprite(0, 0);
 }
 
 // Device-ID editor: big number, turn to change, click to save.
-inline void drawConfigIdEdit(CrowPanelLGFX& gfx, int value) {
+inline void drawConfigIdEdit(LGFX_Sprite& gfx, int value) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
@@ -189,14 +197,16 @@ inline void drawConfigIdEdit(CrowPanelLGFX& gfx, int value) {
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
     gfx.drawString("turn = change   click = save", CX, CY + 58);
+    gfx.pushSprite(0, 0);
 }
 
-inline void drawBootScreen(CrowPanelLGFX& gfx, const char* msg) {
+inline void drawBootScreen(LGFX_Sprite& gfx, const char* msg) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
     gfx.drawString(msg, CX, CY);
+    gfx.pushSprite(0, 0);
 }
 
 } // namespace Render

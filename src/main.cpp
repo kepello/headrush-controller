@@ -104,10 +104,12 @@ volatile bool otaActive = false;
 volatile int  otaPercent = 0;
 volatile bool otaChecking = false;        // true while polling GitHub for a manifest
 volatile bool otaCheckRequested = false;  // set by UI long-press, consumed by net task
+volatile bool rebindRequested = false;    // set when config picks a new param; net re-primes
 
 HeadRushClient hr;
 Preferences prefs;
 CrowPanelLGFX gfx;
+LGFX_Sprite canvas(&gfx);  // off-screen framebuffer; all UI renders here then blits
 String gHostname;  // unique per device (MAC-derived); set once in netTask
 AiEsp32RotaryEncoder encoder(HW::PIN_ENC_A, HW::PIN_ENC_B, HW::PIN_ENC_BTN, /*vcc=*/-1, /*steps_per_click=*/4);
 void IRAM_ATTR encoderISR() { encoder.readEncoder_ISR(); }
@@ -148,18 +150,21 @@ WifiCreds loadCreds() {
 
 void saveDeviceId(int id) {
     Preferences p;
-    p.begin("hrctrl", false);
-    p.putInt("devid", id);
+    bool ok = p.begin("hrctrl", false);
+    size_t n = p.putInt("devid", id);
+    int rb = p.getInt("devid", -1);
     p.end();
-    Serial.printf("Device ID saved: %d\n", id);
+    Serial.printf("[nvs] devid<-%d (open=%d wrote=%u readback=%d)\n", id, ok, (unsigned)n, rb);
 }
 
 void saveParamIndex(int idx) {
     Preferences p;
-    p.begin("hrctrl", false);
-    p.putInt("param", idx);
+    bool ok = p.begin("hrctrl", false);
+    size_t n = p.putInt("param", idx);
+    int rb = p.getInt("param", -1);
     p.end();
-    Serial.printf("Parameter saved: %d (%s)\n", idx, PARAM_CATALOG[idx].label);
+    Serial.printf("[nvs] param<-%d %s (open=%d wrote=%u readback=%d)\n",
+                  idx, PARAM_CATALOG[idx].label, ok, (unsigned)n, rb);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -327,6 +332,7 @@ void netTask(void*) {
     while (true) {
         ArduinoOTA.handle();  // blocks here for the duration of a push update
         if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
+        if (rebindRequested) { rebindRequested = false; primeInitialValue(); }  // new param picked
         hr.loop();
         bool dirty = false;
         float v = 0;
@@ -365,9 +371,12 @@ void setup() {
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
 
     gfx.init();
+    canvas.setColorDepth(16);
+    canvas.setPsram(true);
+    if (!canvas.createSprite(240, 240)) Serial.println("canvas alloc FAILED");
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    Render::drawBootInfo(gfx, deviceId, FW_VERSION);
+    Render::drawBootInfo(canvas, deviceId, FW_VERSION);
 
     encoder.begin();
     encoder.setup(encoderISR);
@@ -391,12 +400,12 @@ void loop() {
     if (otaActive) {  // downloading + flashing
         if (uiMode != UI_UPDATING) { uiMode = UI_UPDATING; lastRenderedOtaPercent = -1; }
         int p = otaPercent;
-        if (p != lastRenderedOtaPercent) { Render::drawOTAProgress(gfx, p); lastRenderedOtaPercent = p; }
+        if (p != lastRenderedOtaPercent) { Render::drawOTAProgress(canvas, p); lastRenderedOtaPercent = p; }
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
     if (otaChecking) {  // polling GitHub for a manifest
-        if (uiMode != UI_CHECKING) { uiMode = UI_CHECKING; Render::drawBootScreen(gfx, "checking update..."); }
+        if (uiMode != UI_CHECKING) { uiMode = UI_CHECKING; Render::drawBootScreen(canvas, "checking update..."); }
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
@@ -429,8 +438,8 @@ void loop() {
     if (cfg == CFG_MENU) {
         if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
-            if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(gfx, editIdValue); }
-            else if (menuIndex == 1) { editParamValue = paramIndex; cfg = CFG_EDIT_PARAM; Render::drawParamPick(gfx, PARAM_CATALOG, PARAM_COUNT, editParamValue); }
+            if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
+            else if (menuIndex == 1) { editParamValue = paramIndex; cfg = CFG_EDIT_PARAM; Render::drawParamPick(canvas, PARAM_CATALOG, PARAM_COUNT, editParamValue); }
             else if (menuIndex == 2) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -438,7 +447,7 @@ void loop() {
         }
         if (edelta != 0) {
             menuIndex = (int)(((menuIndex + edelta) % 4 + 4) % 4);
-            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -446,17 +455,14 @@ void loop() {
 
     // --- Device-ID editor ---
     if (cfg == CFG_EDIT_ID) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (editIdValue != deviceId) {
-                // Identity is read at boot, so reboot to apply the new ID cleanly.
-                saveDeviceId(editIdValue);
-                Render::drawBootScreen(gfx, "saved - rebooting");
-                delay(800);
-                ESP.restart();
+                deviceId = editIdValue;     // identity only; applies immediately
+                saveDeviceId(deviceId);
             }
             cfg = CFG_MENU;
-            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -464,7 +470,7 @@ void loop() {
             editIdValue += (int)edelta;
             if (editIdValue < 1) editIdValue = 1;
             if (editIdValue > 16) editIdValue = 16;
-            Render::drawConfigIdEdit(gfx, editIdValue);
+            Render::drawConfigIdEdit(canvas, editIdValue);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -472,23 +478,24 @@ void loop() {
 
     // --- Parameter picker ---
     if (cfg == CFG_EDIT_PARAM) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (editParamValue != paramIndex) {
-                // The binding is chosen at boot, so reboot to apply the new param.
-                saveParamIndex(editParamValue);
-                Render::drawBootScreen(gfx, "saved - rebooting");
-                delay(800);
-                ESP.restart();
+                // Apply immediately: swap the binding and have the net task
+                // re-prime the new parameter's current value. No reboot.
+                paramIndex = editParamValue;
+                activeBinding = &PARAM_CATALOG[paramIndex];
+                saveParamIndex(paramIndex);
+                rebindRequested = true;
             }
             cfg = CFG_MENU;
-            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) {
             editParamValue = (int)(((editParamValue + edelta) % PARAM_COUNT + PARAM_COUNT) % PARAM_COUNT);
-            Render::drawParamPick(gfx, PARAM_CATALOG, PARAM_COUNT, editParamValue);
+            Render::drawParamPick(canvas, PARAM_CATALOG, PARAM_COUNT, editParamValue);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -498,7 +505,7 @@ void loop() {
     if (longPress) {  // enter config
         cfg = CFG_MENU;
         menuIndex = 0;
-        Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+        Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
@@ -519,7 +526,7 @@ void loop() {
     v = sharedValue;
     portEXIT_CRITICAL(&stateMux);
     if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f) {
-        Render::drawContinuous(gfx, *activeBinding, v);
+        Render::drawContinuous(canvas, *activeBinding, v);
         lastRenderedValue = v;
     }
 
