@@ -23,6 +23,7 @@
 #include "Display.h"
 #include "Binding.h"
 #include "Render.h"
+#include "Roots.h"
 
 #if __has_include("secrets.h")
   #include "secrets.h"
@@ -254,11 +255,6 @@ void setupOTA() {
     Serial.printf("[ota] ready at %s.local\n", gHostname.c_str());
 }
 
-// Full Mozilla CA bundle, embedded in the IDF mbedtls library (esp_crt_bundle).
-// Referenced directly so TLS verification needs no generated/committed bundle.
-extern const uint8_t x509_crt_bundle_start[] asm("_binary_x509_crt_bundle_start");
-extern const uint8_t x509_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
-
 // Pull update: fetch version.json from GitHub Releases, and if it advertises a
 // build number higher than ours, download + flash firmware.bin. Runs in the net
 // task. On a successful flash the device reboots (never returns from update()).
@@ -271,7 +267,7 @@ void checkForUpdate(const char* reason) {
     otaChecking = true;
 
     NetworkClientSecure client;
-    client.setCACertBundle(x509_crt_bundle_start, x509_crt_bundle_end - x509_crt_bundle_start);
+    client.setCACert(GITHUB_ROOTS);  // pinned GitHub roots (the IDF bundle wouldn't validate)
     HTTPClient http;
     http.setConnectTimeout(10000);
     http.setTimeout(10000);
