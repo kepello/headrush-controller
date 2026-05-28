@@ -15,6 +15,7 @@
 #include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
+#include <time.h>
 #include <AiEsp32RotaryEncoder.h>
 #include "HeadRushClient.h"
 #include "Normalize.h"
@@ -104,6 +105,7 @@ volatile uint32_t lastLocalChangeMs = 0;
 volatile bool otaActive = false;
 volatile int  otaPercent = 0;
 volatile bool otaChecking = false;        // true while polling GitHub for a manifest
+char otaStatusMsg[40] = "checking...";    // shown on the checking screen (diagnostic)
 volatile bool otaCheckRequested = false;  // set by UI long-press, consumed by net task
 volatile bool rebindRequested = false;    // set when config picks a new param; net re-primes
 
@@ -260,47 +262,46 @@ extern const uint8_t x509_crt_bundle_end[]   asm("_binary_x509_crt_bundle_end");
 // Pull update: fetch version.json from GitHub Releases, and if it advertises a
 // build number higher than ours, download + flash firmware.bin. Runs in the net
 // task. On a successful flash the device reboots (never returns from update()).
+// Pull update: fetch version.json from GitHub Releases over verified TLS (needs
+// the clock set — see NTP sync in netTask), and if it advertises a build number
+// higher than ours, download + flash firmware.bin. Runs in the net task; a
+// successful flash reboots into the new image. Status shows on the UI.
 void checkForUpdate(const char* reason) {
+    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "checking...");
     otaChecking = true;
-    Serial.printf("[upd] checking (%s)\n", reason);
 
     NetworkClientSecure client;
-    // Verify the server cert against the full Mozilla CA bundle. Covers both
-    // github.com (USERTrust root) and the release CDN (ISRG/Let's Encrypt root),
-    // and survives CA rotation — so a MITM can't serve forged firmware.
     client.setCACertBundle(x509_crt_bundle_start, x509_crt_bundle_end - x509_crt_bundle_start);
-
     HTTPClient http;
-    http.setConnectTimeout(8000);
-    http.setTimeout(8000);
+    http.setConnectTimeout(10000);
+    http.setTimeout(10000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub 302s to its CDN
     if (!http.begin(client, FW_MANIFEST_URL)) {
-        Serial.println("[upd] http begin failed");
-        otaChecking = false; return;
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "begin failed");
+        delay(2500); otaChecking = false; return;
     }
     http.addHeader("User-Agent", "headrush-controller");
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-        Serial.printf("[upd] manifest HTTP %d\n", code);
-        http.end(); otaChecking = false; return;
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed %d", code);
+        http.end(); delay(2500); otaChecking = false; return;
     }
     String body = http.getString();
     http.end();
 
     JsonDocument doc;
     if (deserializeJson(doc, body)) {
-        Serial.println("[upd] manifest parse error");
-        otaChecking = false; return;
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "parse error");
+        delay(2500); otaChecking = false; return;
     }
     int remote = doc["version"] | -1;
     String url = doc["url"] | "";
-    Serial.printf("[upd] remote v%d, local v%d\n", remote, FW_VERSION);
     if (remote <= FW_VERSION || url.isEmpty()) {
-        Serial.println("[upd] up to date");
-        otaChecking = false; return;
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "up to date (v%d)", remote);
+        delay(1500); otaChecking = false; return;
     }
 
-    Serial.printf("[upd] updating → v%d\n", remote);
+    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "updating v%d", remote);
     otaPercent = 0;
     otaActive = true;       // UI switches to the progress ring
     otaChecking = false;
@@ -312,7 +313,8 @@ void checkForUpdate(const char* reason) {
     t_httpUpdate_return r = httpUpdate.update(client, url);
     // Only reached if the update did NOT succeed (success reboots into the new image).
     otaActive = false;
-    Serial.printf("[upd] update failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "update failed %d", (int)r);
+    otaChecking = true; delay(3000); otaChecking = false;
 }
 
 void netTask(void*) {
@@ -321,6 +323,14 @@ void netTask(void*) {
     Serial.printf("[net] hostname: %s.local\n", gHostname.c_str());
     WifiCreds c = loadCreds();
     if (!connectWifi(c)) { vTaskDelete(NULL); return; }
+
+    // Sync the clock via NTP. TLS verifies the server cert's validity dates, and
+    // the ESP32 boots at epoch 1970 — without a real time, every cert looks
+    // "not yet valid" and the handshake fails. Needed before any verified HTTPS.
+    configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+    for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 8000; ) delay(200);
+    Serial.printf("[net] time = %ld\n", (long)time(nullptr));
+
     String host = resolveHost(c);
     hr.onValueChanged(onValueChanged);
     hr.onConnection([](bool up) { Serial.printf("WS %s\n", up ? "connected" : "disconnected"); });
@@ -415,7 +425,12 @@ void loop() {
         return;
     }
     if (otaChecking) {  // polling GitHub for a manifest
-        if (uiMode != UI_CHECKING) { uiMode = UI_CHECKING; Render::drawBootScreen(canvas, "checking update..."); }
+        static char shown[40] = "";
+        if (uiMode != UI_CHECKING || strcmp(shown, otaStatusMsg) != 0) {
+            uiMode = UI_CHECKING;
+            strncpy(shown, otaStatusMsg, sizeof(shown)); shown[sizeof(shown) - 1] = 0;
+            Render::drawBootScreen(canvas, otaStatusMsg);
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
