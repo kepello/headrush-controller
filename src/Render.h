@@ -105,32 +105,73 @@ inline void drawOTAProgress(CrowPanelLGFX& gfx, int percent) {
     gfx.drawString(buf, CX, CY + 4);
 }
 
-// Config-mode menu. Three fixed items; `sel` is the highlighted index.
-inline void drawConfigMenu(CrowPanelLGFX& gfx, int sel, int deviceId, int fwVersion) {
+// Boot splash: firmware version (prominent) plus the device ID.
+inline void drawBootInfo(CrowPanelLGFX& gfx, int deviceId, int fwVersion) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString("HeadRush", CX, CY - 46);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setTextSize(4);
+    char fw[12];
+    snprintf(fw, sizeof(fw), "fw %d", fwVersion);
+    gfx.drawString(fw, CX, CY);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    char id[16];
+    snprintf(id, sizeof(id), "ID %d", deviceId);
+    gfx.drawString(id, CX, CY + 46);
+}
+
+// Config-mode menu. Four items; `sel` is the highlighted index.
+inline void drawConfigMenu(CrowPanelLGFX& gfx, int sel, int deviceId, const char* paramLabel, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
 
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
-    gfx.drawString("CONFIG", CX, 36);
+    gfx.drawString("CONFIG", CX, 30);
 
-    char idbuf[20];
+    char idbuf[20], pbuf[24];
     snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
-    const char* labels[3] = { idbuf, "Update firmware", "Exit" };
-    for (int i = 0; i < 3; ++i) {
-        int y = 92 + i * 36;
+    snprintf(pbuf, sizeof(pbuf), "Param: %s", paramLabel);
+    const char* labels[4] = { idbuf, pbuf, "Update firmware", "Exit" };
+    for (int i = 0; i < 4; ++i) {
+        int y = 76 + i * 32;
         bool s = (i == sel);
         gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
         gfx.setTextSize(2);
         gfx.drawString(labels[i], CX, y);
-        if (s) gfx.drawString(">", CX - 96, y);
+        if (s) gfx.drawString(">", CX - 104, y);
     }
 
     char fwbuf[16];
     snprintf(fwbuf, sizeof(fwbuf), "fw %d", fwVersion);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
-    gfx.drawString(fwbuf, CX, 208);
+    gfx.drawString(fwbuf, CX, 206);
+}
+
+// Parameter picker: spinner showing the highlighted entry with dimmed neighbors.
+inline void drawParamPick(CrowPanelLGFX& gfx, const ContinuousBinding* catalog, int count, int sel) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString("PARAMETER", CX, 38);
+    int prev = (sel - 1 + count) % count;
+    int next = (sel + 1) % count;
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString(catalog[prev].label, CX, CY - 42);
+    gfx.drawString(catalog[next].label, CX, CY + 42);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setTextSize(3);
+    gfx.drawString(catalog[sel].label, CX, CY);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString("turn = change   click = save", CX, 208);
 }
 
 // Device-ID editor: big number, turn to change, click to save.

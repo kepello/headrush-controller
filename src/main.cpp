@@ -50,33 +50,41 @@
   #define FW_MANIFEST_URL "https://github.com/kepello/headrush-controller/releases/latest/download/version.json"
 #endif
 
-// Per-device role table. The device's configured ID (1..16, see config mode)
-// selects one entry, so all units run the same firmware but control different
-// parameters. IDs beyond the table fall back to entry 0 (Output). Output/Input
-// are rig-independent; COMP/REVERB write to effect blocks that must be present
-// in the loaded rig (test mapping). Ranges/formats are from the device's own
+// Catalog of assignable parameters. Each unit picks one entry in config mode
+// (stored in NVS), so identical firmware can drive any of these. Output/Input/
+// Tempo/Width/EQ are rig-independent; Comp/Reverb write to effect blocks that
+// must be present in the loaded rig. Ranges/formats are from the device's own
 // API schema (headrush-api-tree.json).
-const ContinuousBinding DEVICE_BINDINGS[] = {
-    // ID 1 — master output level
+const ContinuousBinding PARAM_CATALOG[] = {
     { .label = "OUTPUT", .path = "/Evil/Engine/Patch/Output", .prop = "RigVolume",
       .dispMin = -60.0f, .dispMax = +36.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
       .zones = { {-30.0f, 0x6B7F}, {-6.0f, 0x07E0}, {+6.0f, 0xFFE0}, {+36.0f, 0xF800} }, .zoneCount = 4 },
-    // ID 2 — guitar input level
     { .label = "INPUT", .path = "/Evil/Engine/Patch/Input", .prop = "InputGain",
       .dispMin = -60.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
       .zones = { {-12.0f, 0x6B7F}, {0.0f, 0x07E0}, {+6.0f, 0xFFE0}, {+12.0f, 0xF800} }, .zoneCount = 4 },
-    // ID 3 — compression amount (requires the Gray Comp block in the loaded rig)
+    { .label = "TEMPO", .path = "/Evil/Engine/Tempo", .prop = "Tempo",
+      .dispMin = 30.0f, .dispMax = 240.0f, .step = 1.0f, .format = "%.0f", .unit = "BPM",
+      .zones = { {240.0f, 0x07E0} }, .zoneCount = 1 },
+    { .label = "WIDTH", .path = "/Evil/Engine/Patch/Output", .prop = "RigWidth",
+      .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
+      .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
+    { .label = "BASS", .path = "/Evil/Engine/GlobalEQMain", .prop = "Gain1",
+      .dispMin = -12.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
+      .zones = { {-3.0f, 0x6B7F}, {+3.0f, 0x07E0}, {+12.0f, 0xFFE0} }, .zoneCount = 3 },
+    { .label = "TREBLE", .path = "/Evil/Engine/GlobalEQMain", .prop = "Gain4",
+      .dispMin = -12.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
+      .zones = { {-3.0f, 0x6B7F}, {+3.0f, 0x07E0}, {+12.0f, 0xFFE0} }, .zoneCount = 3 },
     { .label = "COMP", .path = "/Evil/Engine/Patch/Gray_Comp", .prop = "Sustain",
       .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
       .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
-    // ID 4 — reverb mix (requires the AIR Reverb block in the loaded rig)
     { .label = "REVERB", .path = "/Evil/Engine/Patch/AIR_Reverb", .prop = "Mix",
       .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
       .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
 };
-const int DEVICE_BINDING_COUNT = sizeof(DEVICE_BINDINGS) / sizeof(DEVICE_BINDINGS[0]);
-// Selected from deviceId in setup(), before the net task starts. Read-only after.
-const ContinuousBinding* activeBinding = &DEVICE_BINDINGS[0];
+const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);
+// Selected from the saved parameter index in setup(), before the net task
+// starts. Read-only after.
+const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
@@ -109,13 +117,16 @@ int lastRenderedOtaPercent = -1;
 enum UiMode { UI_GAUGE, UI_CHECKING, UI_UPDATING };
 UiMode uiMode = UI_GAUGE;
 
-// Per-device identity (1..16), set on-device in config mode, persisted in NVS.
+// Per-device identity (1..16) and chosen parameter (index into PARAM_CATALOG),
+// both set on-device in config mode and persisted in NVS.
 volatile int deviceId = 1;
+int paramIndex = 0;
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
-enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID };
+enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM };
 ConfigState cfg = CFG_NONE;
 int menuIndex = 0;
 int editIdValue = 1;
+int editParamValue = 0;
 
 struct WifiCreds { String ssid; String psk; String hostOverride; };
 
@@ -141,6 +152,14 @@ void saveDeviceId(int id) {
     p.putInt("devid", id);
     p.end();
     Serial.printf("Device ID saved: %d\n", id);
+}
+
+void saveParamIndex(int idx) {
+    Preferences p;
+    p.begin("hrctrl", false);
+    p.putInt("param", idx);
+    p.end();
+    Serial.printf("Parameter saved: %d (%s)\n", idx, PARAM_CATALOG[idx].label);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -335,10 +354,11 @@ void setup() {
 
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 1);
+    paramIndex = prefs.getInt("param", 0);
     prefs.end();
-    int bidx = (deviceId >= 1 && deviceId <= DEVICE_BINDING_COUNT) ? deviceId - 1 : 0;
-    activeBinding = &DEVICE_BINDINGS[bidx];
-    Serial.printf("Device ID: %d → role %s (%s.%s)\n", deviceId,
+    if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
+    activeBinding = &PARAM_CATALOG[paramIndex];
+    Serial.printf("Device ID: %d, param %s (%s.%s)\n", deviceId,
                   activeBinding->label, activeBinding->path, activeBinding->prop);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
@@ -347,9 +367,7 @@ void setup() {
     gfx.init();
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    char boot[24];
-    snprintf(boot, sizeof(boot), "ID %d  booting...", deviceId);
-    Render::drawBootScreen(gfx, boot);
+    Render::drawBootInfo(gfx, deviceId, FW_VERSION);
 
     encoder.begin();
     encoder.setup(encoderISR);
@@ -359,6 +377,11 @@ void setup() {
     lastEncoderValue = 0;
 
     xTaskCreatePinnedToCore(netTask, "net", 8192, NULL, 5, NULL, 0);
+
+    // Hold the boot splash long enough to read; the gauge would otherwise
+    // overwrite it within a few ms once loop() starts. WiFi connects on the net
+    // task during this delay, so the wait isn't wasted.
+    delay(1200);
 }
 
 void loop() {
@@ -407,14 +430,15 @@ void loop() {
         if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(gfx, editIdValue); }
-            else if (menuIndex == 1) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+            else if (menuIndex == 1) { editParamValue = paramIndex; cfg = CFG_EDIT_PARAM; Render::drawParamPick(gfx, PARAM_CATALOG, PARAM_COUNT, editParamValue); }
+            else if (menuIndex == 2) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) {
-            menuIndex = (int)(((menuIndex + edelta) % 3 + 3) % 3);
-            Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+            menuIndex = (int)(((menuIndex + edelta) % 4 + 4) % 4);
+            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -422,17 +446,17 @@ void loop() {
 
     // --- Device-ID editor ---
     if (cfg == CFG_EDIT_ID) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (editIdValue != deviceId) {
-                // The role is bound at boot, so reboot to apply the new ID cleanly.
+                // Identity is read at boot, so reboot to apply the new ID cleanly.
                 saveDeviceId(editIdValue);
                 Render::drawBootScreen(gfx, "saved - rebooting");
                 delay(800);
                 ESP.restart();
             }
             cfg = CFG_MENU;
-            Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -446,11 +470,35 @@ void loop() {
         return;
     }
 
+    // --- Parameter picker ---
+    if (cfg == CFG_EDIT_PARAM) {
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (clicked) {
+            if (editParamValue != paramIndex) {
+                // The binding is chosen at boot, so reboot to apply the new param.
+                saveParamIndex(editParamValue);
+                Render::drawBootScreen(gfx, "saved - rebooting");
+                delay(800);
+                ESP.restart();
+            }
+            cfg = CFG_MENU;
+            Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            editParamValue = (int)(((editParamValue + edelta) % PARAM_COUNT + PARAM_COUNT) % PARAM_COUNT);
+            Render::drawParamPick(gfx, PARAM_CATALOG, PARAM_COUNT, editParamValue);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
     // --- Normal gauge mode ---
     if (longPress) {  // enter config
         cfg = CFG_MENU;
         menuIndex = 0;
-        Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
+        Render::drawConfigMenu(gfx, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
