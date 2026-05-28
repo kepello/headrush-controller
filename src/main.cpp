@@ -10,6 +10,9 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
+#include <HTTPClient.h>
+#include <NetworkClientSecure.h>
+#include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <AiEsp32RotaryEncoder.h>
 #include "HeadRushClient.h"
@@ -39,6 +42,12 @@
 // against the published version.json to decide whether to update.
 #ifndef FW_VERSION
   #define FW_VERSION 0
+#endif
+// Where the fleet pulls firmware from. The GitHub Release "latest" channel:
+// version.json carries the build number + the firmware.bin URL. Same URL for
+// every unit — one published release updates the whole fleet.
+#ifndef FW_MANIFEST_URL
+  #define FW_MANIFEST_URL "https://github.com/kepello/headrush-controller/releases/latest/download/version.json"
 #endif
 
 // ---- Knob 1 starter ring (step A: just one binding) ----
@@ -80,6 +89,8 @@ volatile uint32_t lastLocalChangeMs = 0;
 // 32-bit aligned and only drive a progress display, not control flow timing.
 volatile bool otaActive = false;
 volatile int  otaPercent = 0;
+volatile bool otaChecking = false;        // true while polling GitHub for a manifest
+volatile bool otaCheckRequested = false;  // set by UI long-press, consumed by net task
 
 HeadRushClient hr;
 Preferences prefs;
@@ -90,6 +101,8 @@ void IRAM_ATTR encoderISR() { encoder.readEncoder_ISR(); }
 long lastEncoderValue = 0;
 float lastRenderedValue = -999999.0f;
 int lastRenderedOtaPercent = -1;
+enum UiMode { UI_GAUGE, UI_CHECKING, UI_UPDATING };
+UiMode uiMode = UI_GAUGE;
 
 struct WifiCreds { String ssid; String psk; String hostOverride; };
 
@@ -193,6 +206,64 @@ void setupOTA() {
     Serial.printf("[ota] ready at %s.local\n", gHostname.c_str());
 }
 
+// Pull update: fetch version.json from GitHub Releases, and if it advertises a
+// build number higher than ours, download + flash firmware.bin. Runs in the net
+// task. On a successful flash the device reboots (never returns from update()).
+void checkForUpdate(const char* reason) {
+    otaChecking = true;
+    Serial.printf("[upd] checking (%s)\n", reason);
+
+    NetworkClientSecure client;
+    // NOTE: skips server-certificate verification. Acceptable on a trusted LAN,
+    // but for firmware this should be hardened — embed a CA bundle and call
+    // client.setCACertBundle(...) so a MITM can't serve forged firmware.
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setConnectTimeout(8000);
+    http.setTimeout(8000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub 302s to its CDN
+    if (!http.begin(client, FW_MANIFEST_URL)) {
+        Serial.println("[upd] http begin failed");
+        otaChecking = false; return;
+    }
+    http.addHeader("User-Agent", "headrush-controller");
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        Serial.printf("[upd] manifest HTTP %d\n", code);
+        http.end(); otaChecking = false; return;
+    }
+    String body = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body)) {
+        Serial.println("[upd] manifest parse error");
+        otaChecking = false; return;
+    }
+    int remote = doc["version"] | -1;
+    String url = doc["url"] | "";
+    Serial.printf("[upd] remote v%d, local v%d\n", remote, FW_VERSION);
+    if (remote <= FW_VERSION || url.isEmpty()) {
+        Serial.println("[upd] up to date");
+        otaChecking = false; return;
+    }
+
+    Serial.printf("[upd] updating → v%d\n", remote);
+    otaPercent = 0;
+    otaActive = true;       // UI switches to the progress ring
+    otaChecking = false;
+    httpUpdate.rebootOnUpdate(true);
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+    httpUpdate.onProgress([](int cur, int total) {
+        otaPercent = total ? (int)((cur * 100L) / total) : 0;
+    });
+    t_httpUpdate_return r = httpUpdate.update(client, url);
+    // Only reached if the update did NOT succeed (success reboots into the new image).
+    otaActive = false;
+    Serial.printf("[upd] update failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+}
+
 void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
@@ -205,10 +276,12 @@ void netTask(void*) {
     hr.begin(host);
     primeInitialValue();
     setupOTA();
+    if (FW_VERSION > 0) checkForUpdate("boot");  // dev builds (fw 0) skip auto-update
 
     uint32_t lastWriteMs = 0;
     while (true) {
-        ArduinoOTA.handle();  // blocks here for the duration of an update
+        ArduinoOTA.handle();  // blocks here for the duration of a push update
+        if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
         hr.loop();
         bool dirty = false;
         float v = 0;
@@ -253,17 +326,31 @@ void setup() {
 }
 
 void loop() {
-    // During an OTA push, the net task is blocked inside ArduinoOTA.handle();
-    // this task keeps running on its own core and shows the progress bar.
-    if (otaActive) {
+    // Update overlays. The net task may be blocked downloading/flashing on its
+    // own core; this task keeps running and shows progress. Redraw only on a
+    // mode change or a percent change so the screen doesn't flicker.
+    if (otaActive) {  // downloading + flashing
+        if (uiMode != UI_UPDATING) { uiMode = UI_UPDATING; lastRenderedOtaPercent = -1; }
         int p = otaPercent;
-        if (p != lastRenderedOtaPercent) {
-            Render::drawOTAProgress(gfx, p);
-            lastRenderedOtaPercent = p;
-        }
-        lastRenderedValue = -999999.0f;  // force a gauge redraw if OTA aborts
+        if (p != lastRenderedOtaPercent) { Render::drawOTAProgress(gfx, p); lastRenderedOtaPercent = p; }
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
+    }
+    if (otaChecking) {  // polling GitHub for a manifest
+        if (uiMode != UI_CHECKING) { uiMode = UI_CHECKING; Render::drawBootScreen(gfx, "checking update..."); }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        return;
+    }
+    if (uiMode != UI_GAUGE) { uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }  // force gauge redraw on return
+
+    // Hold the encoder button ~1.5s to manually check for an update.
+    static uint32_t btnDownSince = 0;
+    static bool btnFired = false;
+    if (encoder.isEncoderButtonDown()) {
+        if (btnDownSince == 0) { btnDownSince = millis(); btnFired = false; }
+        else if (!btnFired && millis() - btnDownSince >= 1500) { otaCheckRequested = true; btnFired = true; }
+    } else {
+        btnDownSince = 0; btnFired = false;
     }
 
     if (encoder.encoderChanged()) {
