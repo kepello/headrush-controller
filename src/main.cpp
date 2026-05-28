@@ -50,28 +50,32 @@
   #define FW_MANIFEST_URL "https://github.com/kepello/headrush-controller/releases/latest/download/version.json"
 #endif
 
-// ---- Knob 1 starter ring (step A: just one binding) ----
-// Master output: /Evil/Engine/Patch/Output.RigVolume, range -60..+36 dB.
-// Color zones: dim blue safely below stage, green nominal, yellow getting
-// hot, red clipping risk.
-const ContinuousBinding MASTER_OUTPUT = {
-    .label   = "OUTPUT",
-    .path    = "/Evil/Engine/Patch/Output",
-    .prop    = "RigVolume",
-    .dispMin = -60.0f,
-    .dispMax = +36.0f,
-    .step    = 0.5f,
-    .format  = "%+.1f",
-    .unit    = "dB",
-    .zones = {
-        { -30.0f, 0x6B7F },  // soft blue (low)
-        { -6.0f,  0x07E0 },  // green (nominal)
-        { +6.0f,  0xFFE0 },  // yellow (hot)
-        { +36.0f, 0xF800 },  // red (clipping risk)
-    },
-    .zoneCount = 4,
+// Per-device role table. The device's configured ID (1..16, see config mode)
+// selects one entry, so all units run the same firmware but control different
+// parameters. IDs beyond the table fall back to entry 0 (Output). All targets
+// are rig-independent globals, so they work regardless of the loaded rig.
+// Ranges/formats taken from the device's own API schema (headrush-api-tree.json).
+const ContinuousBinding DEVICE_BINDINGS[] = {
+    // ID 1 — master output level
+    { .label = "OUTPUT", .path = "/Evil/Engine/Patch/Output", .prop = "RigVolume",
+      .dispMin = -60.0f, .dispMax = +36.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
+      .zones = { {-30.0f, 0x6B7F}, {-6.0f, 0x07E0}, {+6.0f, 0xFFE0}, {+36.0f, 0xF800} }, .zoneCount = 4 },
+    // ID 2 — global tempo
+    { .label = "TEMPO", .path = "/Evil/Engine/Tempo", .prop = "Tempo",
+      .dispMin = 30.0f, .dispMax = 240.0f, .step = 1.0f, .format = "%.0f", .unit = "BPM",
+      .zones = { {240.0f, 0x07E0} }, .zoneCount = 1 },
+    // ID 3 — stereo width
+    { .label = "WIDTH", .path = "/Evil/Engine/Patch/Output", .prop = "RigWidth",
+      .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
+      .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
+    // ID 4 — global EQ high band (treble)
+    { .label = "TREBLE", .path = "/Evil/Engine/GlobalEQMain", .prop = "Gain4",
+      .dispMin = -12.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
+      .zones = { {-3.0f, 0x6B7F}, {+3.0f, 0x07E0}, {+12.0f, 0xFFE0} }, .zoneCount = 3 },
 };
-const ContinuousBinding* activeBinding = &MASTER_OUTPUT;
+const int DEVICE_BINDING_COUNT = sizeof(DEVICE_BINDINGS) / sizeof(DEVICE_BINDINGS[0]);
+// Selected from deviceId in setup(), before the net task starts. Read-only after.
+const ContinuousBinding* activeBinding = &DEVICE_BINDINGS[0];
 
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
@@ -331,7 +335,10 @@ void setup() {
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 1);
     prefs.end();
-    Serial.printf("Device ID: %d\n", deviceId);
+    int bidx = (deviceId >= 1 && deviceId <= DEVICE_BINDING_COUNT) ? deviceId - 1 : 0;
+    activeBinding = &DEVICE_BINDINGS[bidx];
+    Serial.printf("Device ID: %d → role %s (%s.%s)\n", deviceId,
+                  activeBinding->label, activeBinding->path, activeBinding->prop);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
@@ -416,8 +423,13 @@ void loop() {
     if (cfg == CFG_EDIT_ID) {
         if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
-            deviceId = editIdValue;
-            saveDeviceId(editIdValue);
+            if (editIdValue != deviceId) {
+                // The role is bound at boot, so reboot to apply the new ID cleanly.
+                saveDeviceId(editIdValue);
+                Render::drawBootScreen(gfx, "saved - rebooting");
+                delay(800);
+                ESP.restart();
+            }
             cfg = CFG_MENU;
             Render::drawConfigMenu(gfx, menuIndex, deviceId, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
