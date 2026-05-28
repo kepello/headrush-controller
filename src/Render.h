@@ -110,23 +110,25 @@ inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
     gfx.pushSprite(0, 0);
 }
 
-// Boot splash: firmware version (prominent) plus the device ID.
-inline void drawBootInfo(LGFX_Sprite& gfx, int deviceId, int fwVersion) {
+// Boot/status splash: an accent-ringed "HeadRush" title with fw/ID and a status
+// line. Used for the whole boot sequence (connecting / setting clock / checking
+// updates) and the update-check phase, so the unit shows progress before the
+// dial appears.
+inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char* status) {
     gfx.fillScreen(COLOR_BG);
+    gfx.fillArc(CX, CY, 117, 120, 0, 360, COLOR_FALLBACK);  // accent ring on the round bezel
     gfx.setTextDatum(middle_center);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
-    gfx.drawString("HeadRush", CX, CY - 46);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(4);
-    char fw[12];
-    snprintf(fw, sizeof(fw), "fw %d", fwVersion);
-    gfx.drawString(fw, CX, CY);
+    gfx.setTextSize(3);
+    gfx.drawString("HeadRush", CX, CY - 44);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(2);
-    char id[16];
-    snprintf(id, sizeof(id), "ID %d", deviceId);
-    gfx.drawString(id, CX, CY + 46);
+    char info[24];
+    snprintf(info, sizeof(info), "fw %d   ID %d", fwVersion, deviceId);
+    gfx.drawString(info, CX, CY + 2);
+    gfx.setTextColor(COLOR_FALLBACK, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString(status, CX, CY + 48);
     gfx.pushSprite(0, 0);
 }
 
@@ -197,15 +199,6 @@ inline void drawConfigIdEdit(LGFX_Sprite& gfx, int value) {
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setTextSize(1);
     gfx.drawString("turn = change   click = save", CX, CY + 58);
-    gfx.pushSprite(0, 0);
-}
-
-inline void drawBootScreen(LGFX_Sprite& gfx, const char* msg) {
-    gfx.fillScreen(COLOR_BG);
-    gfx.setTextDatum(middle_center);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
-    gfx.drawString(msg, CX, CY);
     gfx.pushSprite(0, 0);
 }
 

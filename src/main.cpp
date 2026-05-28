@@ -120,8 +120,10 @@ void IRAM_ATTR encoderISR() { encoder.readEncoder_ISR(); }
 long lastEncoderValue = 0;
 float lastRenderedValue = -999999.0f;
 int lastRenderedOtaPercent = -1;
-enum UiMode { UI_GAUGE, UI_CHECKING, UI_UPDATING };
+enum UiMode { UI_GAUGE, UI_SPLASH, UI_UPDATING };
 UiMode uiMode = UI_GAUGE;
+volatile bool bootComplete = false;   // net task sets true after its boot sequence
+char bootMsg[40] = "starting";        // boot-phase status shown on the splash
 
 // Per-device identity (1..16) and chosen parameter (index into PARAM_CATALOG),
 // both set on-device in config mode and persisted in NVS.
@@ -279,9 +281,8 @@ void checkForUpdate(const char* reason) {
     http.addHeader("User-Agent", "headrush-controller");
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
-        time_t now = time(nullptr); struct tm ti; gmtime_r(&now, &ti);
-        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "fail %d y%d", code, ti.tm_year + 1900);
-        http.end(); delay(3000); otaChecking = false; return;
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed (%d)", code);
+        http.end(); delay(2500); otaChecking = false; return;
     }
     String body = http.getString();
     http.end();
@@ -343,24 +344,28 @@ void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
     Serial.printf("[net] hostname: %s.local\n", gHostname.c_str());
+    snprintf(bootMsg, sizeof(bootMsg), "connecting");
     WifiCreds c = loadCreds();
-    if (!connectWifi(c)) { vTaskDelete(NULL); return; }
+    if (!connectWifi(c)) { snprintf(bootMsg, sizeof(bootMsg), "no WiFi"); bootComplete = true; vTaskDelete(NULL); return; }
 
     // Set the clock for verified TLS (cert date checks). Try NTP briefly, then
     // fall back to the HTTPS Date header (NTP/UDP is blocked on some networks
     // while TCP/443 works). Without a real clock, every cert looks not-yet-valid.
+    snprintf(bootMsg, sizeof(bootMsg), "setting clock");
     configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
     for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 4000; ) delay(200);
     if (time(nullptr) < 1700000000) syncClockFromHttp();
     Serial.printf("[net] time = %ld\n", (long)time(nullptr));
 
     String host = resolveHost(c);
+    snprintf(bootMsg, sizeof(bootMsg), "linking Prime");
     hr.onValueChanged(onValueChanged);
     hr.onConnection([](bool up) { Serial.printf("WS %s\n", up ? "connected" : "disconnected"); });
     hr.begin(host);
     primeInitialValue();
     setupOTA();
     if (FW_VERSION > 0) checkForUpdate("boot");  // dev builds (fw 0) skip auto-update
+    bootComplete = true;
 
     uint32_t lastWriteMs = 0;
     while (true) {
@@ -419,7 +424,7 @@ void setup() {
     if (!canvas.createSprite(240, 240)) Serial.println("canvas alloc FAILED");
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
     ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
-    Render::drawBootInfo(canvas, deviceId, FW_VERSION);
+    Render::drawSplash(canvas, deviceId, FW_VERSION, bootMsg);
 
     encoder.begin();
     encoder.setup(encoderISR);
@@ -429,11 +434,8 @@ void setup() {
     lastEncoderValue = 0;
 
     xTaskCreatePinnedToCore(netTask, "net", 8192, NULL, 5, NULL, 0);
-
-    // Hold the boot splash long enough to read; the gauge would otherwise
-    // overwrite it within a few ms once loop() starts. WiFi connects on the net
-    // task during this delay, so the wait isn't wasted.
-    delay(1200);
+    // The splash stays up (showing live boot status) until the net task signals
+    // bootComplete; the UI loop drives it, so no fixed delay is needed here.
 }
 
 void loop() {
@@ -447,12 +449,16 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
-    if (otaChecking) {  // polling GitHub for a manifest
+    // Splash phase: the boot sequence (connecting / setting clock / linking
+    // Prime) and the update check both show status on the splash, so the dial
+    // only appears once the unit is fully ready.
+    if (!bootComplete || otaChecking) {
+        const char* msg = otaChecking ? otaStatusMsg : bootMsg;
         static char shown[40] = "";
-        if (uiMode != UI_CHECKING || strcmp(shown, otaStatusMsg) != 0) {
-            uiMode = UI_CHECKING;
-            strncpy(shown, otaStatusMsg, sizeof(shown)); shown[sizeof(shown) - 1] = 0;
-            Render::drawBootScreen(canvas, otaStatusMsg);
+        if (uiMode != UI_SPLASH || strcmp(shown, msg) != 0) {
+            uiMode = UI_SPLASH;
+            strncpy(shown, msg, sizeof(shown)); shown[sizeof(shown) - 1] = 0;
+            Render::drawSplash(canvas, deviceId, FW_VERSION, msg);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
