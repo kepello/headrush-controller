@@ -529,7 +529,10 @@ void checkForUpdate(const char* reason) {
     for (int i = 0; i < 3 && time(nullptr) < 1700000000; ++i)
         if (!syncClockFromHttp()) delay(800);
 
-    // Fetch the manifest, retrying transient TLS/network failures.
+    // Fetch the manifest, retrying transient TLS/network failures. A unique
+    // cache-busting query + no-cache headers force a fresh version.json: without
+    // them a CDN/proxy edge can keep serving a stale manifest, so a board reads
+    // an old version and reports "up to date" while others see the new release.
     int code = 0;
     String body;
     for (int attempt = 0; attempt < 3 && code != HTTP_CODE_OK; ++attempt) {
@@ -539,8 +542,11 @@ void checkForUpdate(const char* reason) {
         http.setConnectTimeout(10000);
         http.setTimeout(10000);
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub 302s to its CDN
-        if (http.begin(client, FW_MANIFEST_URL)) {
+        String url = String(FW_MANIFEST_URL) + "?cb=" + String((uint32_t)millis()) + String(random(1000000));
+        if (http.begin(client, url)) {
             http.addHeader("User-Agent", "headrush-controller");
+            http.addHeader("Cache-Control", "no-cache");
+            http.addHeader("Pragma", "no-cache");
             code = http.GET();
             if (code == HTTP_CODE_OK) body = http.getString();
             http.end();
@@ -564,6 +570,8 @@ void checkForUpdate(const char* reason) {
         snprintf(otaStatusMsg, sizeof(otaStatusMsg), "up to date (v%d)", remote);
         delay(1500); otaChecking = false; return;
     }
+    // Same cache-busting for the binary so we never flash a stale image.
+    url += (url.indexOf('?') >= 0 ? "&cb=" : "?cb=") + String((uint32_t)millis()) + String(random(1000000));
 
     snprintf(otaStatusMsg, sizeof(otaStatusMsg), "updating v%d", remote);
     otaPercent = 0;
