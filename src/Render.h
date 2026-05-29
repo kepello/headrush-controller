@@ -91,6 +91,58 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
     gfx.pushSprite(0, 0);
 }
 
+// Tuner view: the arc spans -50..+50 cents with a fixed center target tick. A
+// colored marker rides the arc at the live pitch offset; the big center letter
+// is the detected note. Green when in tune, amber when off. Same top indicators
+// (status dot + signal bars) as the dial. Call from the UI task only.
+inline void drawTuner(LGFX_Sprite& gfx, const char* note, float cents, uint16_t statusDot, int sigLevel) {
+    gfx.fillScreen(COLOR_BG);
+
+    gfx.fillCircle(CX - 24, CY - 80, 6, statusDot);
+    for (int b = 0; b < 4; ++b) {
+        int bh = 4 + b * 3;
+        gfx.fillRect(CX - 6 + b * 7, (CY - 73) - bh, 4, bh, b < sigLevel ? COLOR_VALUE : COLOR_DIM);
+    }
+
+    constexpr uint16_t TUNER_GREEN = 0x07E6;   // in tune
+    constexpr uint16_t TUNER_AMBER = 0xFD20;   // off pitch
+    bool haveNote = note && note[0] && strcmp(note, "--") != 0;
+    bool inTune = haveNote && fabsf(cents) <= 3.0f;
+    uint16_t accent = !haveNote ? COLOR_LABEL : (inTune ? TUNER_GREEN : TUNER_AMBER);
+
+    // Background arc + fixed center target tick (12 o'clock = perfectly in tune).
+    gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, ARC_START_DEG, ARC_END_DEG, COLOR_DIM);
+    float midDeg = ARC_START_DEG + ARC_SPAN_DEG * 0.5f;
+    gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, midDeg - 1.2f, midDeg + 1.2f, COLOR_VALUE);
+
+    // Live marker at the cents position (only when we have a reading).
+    if (haveNote) {
+        float f = (cents + 50.0f) / 100.0f;
+        if (f < 0) f = 0;
+        if (f > 1) f = 1;
+        float a = ARC_START_DEG + ARC_SPAN_DEG * f;
+        gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, a - 4.0f, a + 4.0f, accent);
+    }
+
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString("TUNER", CX, CY - 50);
+
+    gfx.setTextColor(accent, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold24pt7b);
+    gfx.drawString(haveNote ? note : "--", CX, CY + 4);
+
+    char buf[16];
+    if (!haveNote)      snprintf(buf, sizeof(buf), "listening");
+    else if (inTune)    snprintf(buf, sizeof(buf), "in tune");
+    else                snprintf(buf, sizeof(buf), "%s%dc", cents < 0 ? "-" : "+", (int)(fabsf(cents) + 0.5f));
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString(buf, CX, CY + 44);
+    gfx.pushSprite(0, 0);
+}
+
 // Full-screen OTA progress: a ring that fills with the update percentage and a
 // big "NN%" readout. Call from the UI task only (same as drawContinuous).
 inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
@@ -141,7 +193,7 @@ inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char
 }
 
 // Config-mode menu. Five items; `sel` is the highlighted index.
-inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* paramLabel, int fwVersion) {
+inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, int ringCount, int fwVersion) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
 
@@ -149,9 +201,9 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
     gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("CONFIG", CX, 24);
 
-    char idbuf[20], pbuf[24];
+    char idbuf[20], pbuf[20];
     snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
-    snprintf(pbuf, sizeof(pbuf), "Param: %s", paramLabel);
+    snprintf(pbuf, sizeof(pbuf), "Views: %d", ringCount);
     const char* labels[5] = { idbuf, pbuf, "WiFi", "Update firmware", "Exit" };
     for (int i = 0; i < 5; ++i) {
         int y = 58 + i * 30;
@@ -170,25 +222,37 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
     gfx.pushSprite(0, 0);
 }
 
-// Parameter picker: spinner showing the highlighted entry with dimmed neighbors.
-inline void drawParamPick(LGFX_Sprite& gfx, const ContinuousBinding* catalog, int count, int sel) {
+// Views multi-select: spinner over the selectable views with [x]/[ ] checkboxes,
+// plus a trailing "done" slot at index == viewCount. Indices below paramCount are
+// dial params (catalog labels); the rest are named special views (Tuner). `sel`
+// is 0..viewCount.
+inline void drawViewSelect(LGFX_Sprite& gfx, const ContinuousBinding* catalog, int paramCount, int viewCount, int sel, uint32_t mask) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString("PARAMETER", CX, 38);
-    int prev = (sel - 1 + count) % count;
-    int next = (sel + 1) % count;
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString(catalog[prev].label, CX, CY - 42);
-    gfx.drawString(catalog[next].label, CX, CY + 42);
-    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setFont(&fonts::FreeSansBold18pt7b);
-    gfx.drawString(catalog[sel].label, CX, CY);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString("VIEWS", CX, 32);
+    int total = viewCount + 1;
+    char pb[28], cb[28], nb[28];
+    auto viewLabel = [&](int i) -> const char* {
+        return (i < paramCount) ? catalog[i].label : "Tuner";
+    };
+    auto fill = [&](int i, char* buf) {
+        if (i >= viewCount) snprintf(buf, 28, "done");
+        else snprintf(buf, 28, "[%c] %s", (mask & (1u << i)) ? 'x' : ' ', viewLabel(i));
+    };
+    int prev = (sel - 1 + total) % total, next = (sel + 1) % total;
+    fill(prev, pb); fill(sel, cb); fill(next, nb);
     gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.drawString("turn = change   click = save", CX, 208);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString(pb, CX, CY - 40);
+    gfx.drawString(nb, CX, CY + 40);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.drawString(cb, CX, CY);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString(sel < viewCount ? "click = toggle" : "click = done", CX, 206);
     gfx.pushSprite(0, 0);
 }
 

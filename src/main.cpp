@@ -85,9 +85,38 @@ const ContinuousBinding PARAM_CATALOG[] = {
       .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
 };
 const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);
-// Selected from the saved parameter index in setup(), before the net task
-// starts. Read-only after.
+// Selected from the board's view ring in setup(). Read-only after, except a
+// short click (cycle) or config swaps the pointer.
 const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
+
+// View ring: a board cycles an ordered subset of views with a short click.
+// View indices 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; index PARAM_COUNT
+// is the Tuner view (no dial — a live note/cents gauge). viewMask bit i selects
+// view i for this board's ring. (Library/Setlist view comes later.)
+const int TUNER_VIEW = PARAM_COUNT;
+const int VIEW_COUNT = PARAM_COUNT + 1;
+uint32_t viewMask = 0;
+int ringSlot = 0;        // which enabled view is currently shown
+inline bool viewIsTuner(int v) { return v == TUNER_VIEW; }
+int ringSize() { int n = 0; for (int i = 0; i < VIEW_COUNT; ++i) if (viewMask & (1u << i)) n++; return n; }
+int ringViewAt(int slot) {  // view index of the slot-th enabled view (-1 if none)
+    int seen = 0;
+    for (int i = 0; i < VIEW_COUNT; ++i) if (viewMask & (1u << i)) { if (seen == slot) return i; seen++; }
+    return -1;
+}
+
+// Tuner view shared state. The UI task sets tunerActive when the current ring
+// slot is the Tuner; the net task then mutes the Prime (user's choice) and polls
+// FFTCtrl for the live note + cents, publishing them here under stateMux.
+const char* TUNER_CFG_PATH = "/Evil/Engine/AudioCtrl/Tuner";   // TunerMuting (bool)
+const char* TUNER_FFT_PATH = "/Evil/Engine/FFTCtrl";           // TunerString, TunerCents
+const float TUNER_CENTS_MIN = -50.0f;   // assumed FFTCtrl.TunerCents display range; the
+const float TUNER_CENTS_MAX =  50.0f;   // wire is normalized 0..1 — verify on hardware
+volatile bool tunerActive = false;      // UI: current view is the tuner
+volatile float tunerCents = 0.0f;       // net: latest pitch offset (display cents)
+char tunerNote[8] = "--";               // net writes, UI reads (guarded by stateMux)
+float lastTunerCents = -999.0f;         // UI redraw tracking
+char lastTunerNote[8] = "";
 
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
@@ -154,13 +183,30 @@ static int signalLevel(int rssi) {   // 0..4 bars
 // both set on-device in config mode and persisted in NVS.
 volatile int deviceId = 1;
 int paramIndex = 0;
+
+// Make the given ring slot the current view. Tuner views just raise tunerActive
+// (the net task reconciles muting/polling); param views point activeBinding at
+// the catalog entry and ask the net task to re-prime. Called from the UI task.
+void applyView(int slot) {
+    int v = ringViewAt(slot);
+    if (v < 0) v = 0;
+    if (viewIsTuner(v)) {
+        tunerActive = true;
+    } else {
+        tunerActive = false;
+        paramIndex = v;
+        activeBinding = &PARAM_CATALOG[v];
+    }
+    rebindRequested = true;
+}
+
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
-enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM,
+enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_VIEWS,
                    CFG_WIFI, CFG_WIFI_PW, CFG_WIFI_CONNECTING };
 ConfigState cfg = CFG_NONE;
 int menuIndex = 0;
 int editIdValue = 1;
-int editParamValue = 0;
+int viewSel = 0;   // cursor in the VIEWS multi-select (0..VIEW_COUNT = done)
 
 // On-device WiFi setup: the net task scans/connects, the UI picks + types.
 volatile bool scanRequested = false;  // UI -> net: run a scan
@@ -213,14 +259,12 @@ void saveDeviceId(int id) {
     Serial.printf("[nvs] devid<-%d (open=%d wrote=%u readback=%d)\n", id, ok, (unsigned)n, rb);
 }
 
-void saveParamIndex(int idx) {
+void saveViewMask(uint32_t mask) {
     Preferences p;
-    bool ok = p.begin("hrctrl", false);
-    size_t n = p.putInt("param", idx);
-    int rb = p.getInt("param", -1);
+    p.begin("hrctrl", false);
+    p.putUInt("views", mask);
     p.end();
-    Serial.printf("[nvs] param<-%d %s (open=%d wrote=%u readback=%d)\n",
-                  idx, PARAM_CATALOG[idx].label, ok, (unsigned)n, rb);
+    Serial.printf("[nvs] views<-0x%X\n", mask);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -278,6 +322,39 @@ void primeInitialValue() {
         sharedValue = disp;
         portEXIT_CRITICAL(&stateMux);
         Serial.printf("Initial %s = %.2f (wire=%.4f)\n", activeBinding->label, disp, wire);
+    }
+}
+
+// Reconcile the Prime tuner with the UI's tunerActive flag, and while engaged
+// poll FFTCtrl for the live note + cents. Called every net-loop iteration when
+// online. Muting follows the user's "mute while tuning" choice.
+void serviceTuner() {
+    static bool engaged = false;
+    static uint32_t lastPollMs = 0;
+    if (tunerActive && !engaged) {
+        hr.setProperty(TUNER_CFG_PATH, "TunerMuting", true);
+        engaged = true;
+        lastPollMs = 0;  // poll right away
+    } else if (!tunerActive && engaged) {
+        hr.setProperty(TUNER_CFG_PATH, "TunerMuting", false);
+        engaged = false;
+        portENTER_CRITICAL(&stateMux);
+        strcpy(tunerNote, "--");
+        tunerCents = 0.0f;
+        portEXIT_CRITICAL(&stateMux);
+    }
+    if (engaged && millis() - lastPollMs >= 120) {
+        lastPollMs = millis();
+        JsonDocument doc;
+        if (hr.getProperties(TUNER_FFT_PATH, doc)) {
+            float cents = HR::wireToDisplay(doc["TunerCents"].as<float>(), TUNER_CENTS_MIN, TUNER_CENTS_MAX);
+            const char* note = doc["TunerString"].is<const char*>() ? doc["TunerString"].as<const char*>() : "--";
+            portENTER_CRITICAL(&stateMux);
+            tunerCents = cents;
+            strncpy(tunerNote, note, sizeof(tunerNote));
+            tunerNote[sizeof(tunerNote) - 1] = 0;
+            portEXIT_CRITICAL(&stateMux);
+        }
     }
 }
 
@@ -491,8 +568,9 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-            if (rebindRequested) { rebindRequested = false; primeInitialValue(); }  // new param picked
+            if (rebindRequested) { rebindRequested = false; if (!tunerActive) primeInitialValue(); }  // new view picked
             hr.loop();
+            serviceTuner();
             if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; wifiRssi = 0; }
             else { static uint32_t lastRssiMs = 0; if (millis() - lastRssiMs > 1000) { lastRssiMs = millis(); wifiRssi = WiFi.RSSI(); } }
             bool dirty = false;
@@ -533,6 +611,7 @@ void setup() {
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 0);   // 0 = never provisioned
     paramIndex = prefs.getInt("param", 0);
+    viewMask = prefs.getUInt("views", 0);
     prefs.end();
 #ifdef PROVISION_ID
     // Fleet provisioning: bake this unit's ID at flash time, but only if it
@@ -541,8 +620,13 @@ void setup() {
 #endif
     if (deviceId < 1 || deviceId > 16) deviceId = 1;
     if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
-    activeBinding = &PARAM_CATALOG[paramIndex];
-    Serial.printf("Device ID: %d, param %s\n", deviceId, activeBinding->label);
+    if (viewMask == 0) viewMask = (1u << paramIndex);  // migrate old single param to a one-view ring
+    viewMask &= (1u << VIEW_COUNT) - 1;                 // drop any bits past the known views
+    if (ringSize() == 0) viewMask = (1u << 0);
+    ringSlot = 0;
+    applyView(ringSlot);
+    Serial.printf("Device ID: %d, views 0x%X, view %s\n", deviceId, viewMask,
+                  tunerActive ? "Tuner" : activeBinding->label);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
@@ -622,7 +706,7 @@ void loop() {
         if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
-            else if (menuIndex == 1) { editParamValue = paramIndex; cfg = CFG_EDIT_PARAM; Render::drawParamPick(canvas, PARAM_CATALOG, PARAM_COUNT, editParamValue); }
+            else if (menuIndex == 1) { viewSel = 0; cfg = CFG_EDIT_VIEWS; Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask); }
             else if (menuIndex == 2) { cfg = CFG_WIFI; wifiPickIndex = 0; scanDone = false; scanRequested = true; }  // scan starts
             else if (menuIndex == 3) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
@@ -631,7 +715,7 @@ void loop() {
         }
         if (edelta != 0) {
             menuIndex = (int)(((menuIndex + edelta) % 5 + 5) % 5);
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -647,7 +731,7 @@ void loop() {
             return;
         }
         shownScanning = false;
-        if (longPress) { cfg = CFG_MENU; shownPick = -2; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { cfg = CFG_MENU; shownPick = -2; Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (scanCount <= 0) {  // no networks — click to rescan
             if (clicked) { scanDone = false; scanRequested = true; shownPick = -2; vTaskDelay(pdMS_TO_TICKS(5)); return; }
             if (shownPick != -1) { shownPick = -1; Render::drawWifiPicker(canvas, scanSSIDs, 0, 0); }
@@ -681,7 +765,7 @@ void loop() {
         };
         if (longPress) {  // cancel back to menu
             cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -732,14 +816,14 @@ void loop() {
 
     // --- Device-ID editor ---
     if (cfg == CFG_EDIT_ID) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (editIdValue != deviceId) {
                 deviceId = editIdValue;     // identity only; applies immediately
                 saveDeviceId(deviceId);
             }
             cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -753,26 +837,31 @@ void loop() {
         return;
     }
 
-    // --- Parameter picker ---
-    if (cfg == CFG_EDIT_PARAM) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
-        if (clicked) {
-            if (editParamValue != paramIndex) {
-                // Apply immediately: swap the binding and have the net task
-                // re-prime the new parameter's current value. No reboot.
-                paramIndex = editParamValue;
-                activeBinding = &PARAM_CATALOG[paramIndex];
-                saveParamIndex(paramIndex);
-                rebindRequested = true;
-            }
+    // --- Views multi-select ---
+    // Spinner over VIEW_COUNT params plus a trailing "done" slot (index ==
+    // VIEW_COUNT). Click on a param toggles whether this board's ring includes
+    // it; click on "done" (or long-press) commits the ring and returns to menu.
+    if (cfg == CFG_EDIT_VIEWS) {
+        auto commit = [&]() {
+            if (ringSize() == 0) viewMask = (1u << 0);   // never leave an empty ring
+            saveViewMask(viewMask);
+            if (ringSlot >= ringSize()) ringSlot = 0;
+            applyView(ringSlot);
             cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
+        };
+        if (longPress) { commit(); return; }
+        if (clicked) {
+            if (viewSel >= VIEW_COUNT) { commit(); return; }
+            viewMask ^= (1u << viewSel);
+            Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask);
             return;
         }
         if (edelta != 0) {
-            editParamValue = (int)(((editParamValue + edelta) % PARAM_COUNT + PARAM_COUNT) % PARAM_COUNT);
-            Render::drawParamPick(canvas, PARAM_CATALOG, PARAM_COUNT, editParamValue);
+            int total = VIEW_COUNT + 1;
+            viewSel = (((viewSel + edelta) % total) + total) % total;
+            Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -782,10 +871,43 @@ void loop() {
     if (longPress) {  // enter config
         cfg = CFG_MENU;
         menuIndex = 0;
-        Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+        Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
+    if (clicked && ringSize() > 1) {  // short click cycles to the next view in the ring
+        ringSlot = (ringSlot + 1) % ringSize();
+        applyView(ringSlot);
+        lastRenderedValue = -999999.0f;  // force a redraw of the new view
+        lastTunerCents = -999.0f;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Tuner view --- (no encoder writes; the net task drives the readout)
+    if (tunerActive) {
+        char note[8];
+        float cents;
+        portENTER_CRITICAL(&stateMux);
+        strncpy(note, tunerNote, sizeof(note));
+        cents = tunerCents;
+        portEXIT_CRITICAL(&stateMux);
+        note[sizeof(note) - 1] = 0;
+        uint16_t sc = statusColor(connStatus);
+        int sl = signalLevel(wifiRssi);
+        if (fabsf(cents - lastTunerCents) >= 1.0f || strcmp(note, lastTunerNote) != 0 ||
+            sc != lastStatusColor || sl != lastSignalLevel) {
+            Render::drawTuner(canvas, note, cents, sc, sl);
+            lastTunerCents = cents;
+            strncpy(lastTunerNote, note, sizeof(lastTunerNote));
+            lastTunerNote[sizeof(lastTunerNote) - 1] = 0;
+            lastStatusColor = sc;
+            lastSignalLevel = sl;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
     if (edelta != 0) {
         portENTER_CRITICAL(&stateMux);
         float nv = sharedValue + edelta * activeBinding->step;
