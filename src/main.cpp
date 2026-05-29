@@ -15,6 +15,7 @@
 #include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <nvs_flash.h>
+#include <esp_random.h>
 #include <time.h>
 #include <AiEsp32RotaryEncoder.h>
 #include "HeadRushClient.h"
@@ -694,7 +695,16 @@ void netTask(void*) {
         hr.begin(host);
         primeInitialValue();
         setupOTA();
-        if (FW_VERSION > 0) checkForUpdate("boot");  // dev builds (fw 0) skip auto-update
+        if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
+            // Stagger the boot update-check so a rack of boards powered on together
+            // don't all hit WiFi/TLS + the ~1.4MB download at once (which starved
+            // one unit and made it time out). Per-device base slot guarantees
+            // separation; esp_random() jitter keeps them from relocking each boot.
+            uint32_t jitterMs = (uint32_t)(deviceId - 1) * 3000 + (esp_random() % 2000);
+            snprintf(bootMsg, sizeof(bootMsg), "update in %us", (unsigned)((jitterMs + 999) / 1000));
+            vTaskDelay(pdMS_TO_TICKS(jitterMs));
+            checkForUpdate("boot");
+        }
     } else {
         connStatus = CS_WIFI_ERR;
         snprintf(bootMsg, sizeof(bootMsg), "WiFi failed");
