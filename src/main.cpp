@@ -149,6 +149,24 @@ void IRAM_ATTR encoderISR() { encoder.readEncoder_ISR(); }
 long lastEncoderValue = 0;
 float lastRenderedValue = -999999.0f;
 int lastRenderedOtaPercent = -1;
+
+// Backlight dimming: after a spell with no input or on-screen change, drop the
+// LEDC duty to save power; any activity restores full brightness instantly.
+constexpr int BL_FULL_DUTY = (DisplayHW::BL_DEFAULT_PCT * 255) / 100;
+constexpr int BL_DIM_DUTY  = (12 * 255) / 100;   // ~12% when idle
+constexpr uint32_t IDLE_DIM_MS = 30000;
+uint32_t lastActivityMs = 0;
+bool screenDimmed = false;
+void noteActivity() {
+    lastActivityMs = millis();
+    if (screenDimmed) { screenDimmed = false; ledcWrite(HW::PIN_DISP_BL, BL_FULL_DUTY); }
+}
+void updateBacklight() {
+    if (!screenDimmed && (millis() - lastActivityMs) > IDLE_DIM_MS) {
+        screenDimmed = true;
+        ledcWrite(HW::PIN_DISP_BL, BL_DIM_DUTY);
+    }
+}
 enum UiMode { UI_GAUGE, UI_SPLASH, UI_UPDATING };
 UiMode uiMode = UI_GAUGE;
 volatile bool bootComplete = false;   // net task sets true after its boot sequence
@@ -648,7 +666,8 @@ void setup() {
     canvas.setPsram(true);
     if (!canvas.createSprite(240, 240)) Serial.println("canvas alloc FAILED");
     ledcAttach(HW::PIN_DISP_BL, DisplayHW::BL_LEDC_FREQ, DisplayHW::BL_LEDC_RESOLUTION_BITS);
-    ledcWrite(HW::PIN_DISP_BL, (DisplayHW::BL_DEFAULT_PCT * 255) / 100);
+    ledcWrite(HW::PIN_DISP_BL, BL_FULL_DUTY);
+    lastActivityMs = millis();
     Render::drawSplash(canvas, deviceId, FW_VERSION, bootMsg);
 
     encoder.begin();
@@ -664,6 +683,11 @@ void setup() {
 }
 
 void loop() {
+    // Keep the screen lit through boot, update checks, and downloads; otherwise
+    // let it dim after a spell of no activity.
+    if (otaActive || otaChecking || !bootComplete) noteActivity();
+    updateBacklight();
+
     // Net-driven overlays take priority over everything, including config mode:
     // a download/flash may be running on the other core. Redraw only on a mode
     // or percent change so the screen doesn't flicker.
@@ -712,6 +736,7 @@ void loop() {
         edelta = (v - lastEncoderValue) * ENCODER_SIGN;
         lastEncoderValue = v;
     }
+    if (edelta != 0 || clicked || longPress) noteActivity();
 
     // --- Config menu ---
     if (cfg == CFG_MENU) {
@@ -907,8 +932,9 @@ void loop() {
         note[sizeof(note) - 1] = 0;
         uint16_t sc = statusColor(connStatus);
         int sl = signalLevel(wifiRssi);
-        if (fabsf(cents - lastTunerCents) >= 1.0f || strcmp(note, lastTunerNote) != 0 ||
-            sc != lastStatusColor || sl != lastSignalLevel) {
+        bool tunerChanged = fabsf(cents - lastTunerCents) >= 1.0f || strcmp(note, lastTunerNote) != 0;
+        if (tunerChanged) noteActivity();  // an active note keeps the screen lit while tuning
+        if (tunerChanged || sc != lastStatusColor || sl != lastSignalLevel) {
             Render::drawTuner(canvas, note, cents, sc, sl);
             lastTunerCents = cents;
             strncpy(lastTunerNote, note, sizeof(lastTunerNote));
@@ -938,7 +964,9 @@ void loop() {
     portEXIT_CRITICAL(&stateMux);
     uint16_t sc = statusColor(connStatus);
     int sl = signalLevel(wifiRssi);
-    if (fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f || sc != lastStatusColor || sl != lastSignalLevel) {
+    bool valueChanged = fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f;
+    if (valueChanged) noteActivity();  // a moving value (local or external) keeps the screen awake
+    if (valueChanged || sc != lastStatusColor || sl != lastSignalLevel) {
         Render::drawContinuous(canvas, *activeBinding, v, sc, sl);
         lastRenderedValue = v;
         lastStatusColor = sc;

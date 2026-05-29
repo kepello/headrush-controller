@@ -39,19 +39,26 @@ inline float frac(const ContinuousBinding& cb, float v) {
     return f;
 }
 
+// Connection-status dot (color set by caller) + WiFi signal bars, drawn in the
+// open bottom of the arc (the 120° gap below the value) where there's more room
+// than crowding the top. Shared by the dial and the tuner.
+inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusDot, int sigLevel) {
+    constexpr int yBase = CY + 86;
+    gfx.fillCircle(CX - 24, yBase - 6, 6, statusDot);
+    for (int b = 0; b < 4; ++b) {
+        int bh = 4 + b * 3;                       // bar heights 4,7,10,13
+        gfx.fillRect(CX - 6 + b * 7, yBase - bh, 4, bh,
+                     b < sigLevel ? COLOR_VALUE : COLOR_DIM);
+    }
+}
+
 // Draw the full arc gauge for a continuous binding. Background arc + colored
 // foreground proportional to value. Center: big value text + small unit. Top:
 // short label. Call from the UI task only.
 inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot, int sigLevel) {
     gfx.fillScreen(COLOR_BG);
 
-    // Top indicators: connection-status dot (color set by caller) + WiFi signal bars.
-    gfx.fillCircle(CX - 24, CY - 80, 6, statusDot);
-    for (int b = 0; b < 4; ++b) {
-        int bh = 4 + b * 3;                       // bar heights 4,7,10,13
-        gfx.fillRect(CX - 6 + b * 7, (CY - 73) - bh, 4, bh,
-                     b < sigLevel ? COLOR_VALUE : COLOR_DIM);
-    }
+    drawStatusIndicators(gfx, statusDot, sigLevel);
 
     // Background arc (full sweep, dim).
     gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, ARC_START_DEG, ARC_END_DEG, COLOR_DIM);
@@ -98,11 +105,7 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
 inline void drawTuner(LGFX_Sprite& gfx, const char* note, float cents, uint16_t statusDot, int sigLevel) {
     gfx.fillScreen(COLOR_BG);
 
-    gfx.fillCircle(CX - 24, CY - 80, 6, statusDot);
-    for (int b = 0; b < 4; ++b) {
-        int bh = 4 + b * 3;
-        gfx.fillRect(CX - 6 + b * 7, (CY - 73) - bh, 4, bh, b < sigLevel ? COLOR_VALUE : COLOR_DIM);
-    }
+    drawStatusIndicators(gfx, statusDot, sigLevel);
 
     constexpr uint16_t TUNER_GREEN = 0x07E6;   // in tune
     constexpr uint16_t TUNER_AMBER = 0xFD20;   // off pitch
