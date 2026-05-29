@@ -601,11 +601,11 @@ void loop() {
         static bool fired = false;
         if (encoder.isEncoderButtonDown()) {
             if (down == 0) { down = millis(); fired = false; }
-            else if (!fired && millis() - down >= 5000) { longPress = true; fired = true; }
+            else if (!fired && millis() - down >= 4000) { longPress = true; fired = true; }
         } else {
             if (down != 0 && !fired) {
                 uint32_t held = millis() - down;
-                if (held >= 40 && held < 5000) clicked = true;  // debounced short press
+                if (held >= 40 && held < 4000) clicked = true;  // debounced short press
             }
             down = 0;
         }

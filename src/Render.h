@@ -72,12 +72,12 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
     // Label at the top inside the arc.
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString(cb.label, CX, CY - 50);
 
     // Big value text.
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(5);
+    gfx.setFont(&fonts::FreeSansBold24pt7b);
     char buf[24];
     snprintf(buf, sizeof(buf), cb.format, value);
     gfx.drawString(buf, CX, CY + 4);
@@ -85,7 +85,7 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
     // Unit text.
     if (cb.unit && cb.unit[0]) {
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-        gfx.setTextSize(2);
+        gfx.setFont(&fonts::FreeSansBold12pt7b);
         gfx.drawString(cb.unit, CX, CY + 44);
     }
     gfx.pushSprite(0, 0);
@@ -107,11 +107,11 @@ inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
 
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("UPDATING", CX, CY - 50);
 
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(5);
+    gfx.setFont(&fonts::FreeSansBold24pt7b);
     char buf[8];
     snprintf(buf, sizeof(buf), "%d%%", percent);
     gfx.drawString(buf, CX, CY + 4);
@@ -127,15 +127,15 @@ inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char
     gfx.fillArc(CX, CY, 117, 120, 0, 360, COLOR_FALLBACK);  // accent ring on the round bezel
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(3);
+    gfx.setFont(&fonts::FreeSansBold18pt7b);
     gfx.drawString("HeadRush", CX, CY - 44);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     char info[24];
     snprintf(info, sizeof(info), "fw %d   ID %d", fwVersion, deviceId);
     gfx.drawString(info, CX, CY + 2);
     gfx.setTextColor(COLOR_FALLBACK, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString(status, CX, CY + 48);
     gfx.pushSprite(0, 0);
 }
@@ -146,7 +146,7 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
     gfx.setTextDatum(middle_center);
 
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("CONFIG", CX, 24);
 
     char idbuf[20], pbuf[24];
@@ -157,7 +157,7 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
         int y = 58 + i * 30;
         bool s = (i == sel);
         gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
-        gfx.setTextSize(2);
+        gfx.setFont(&fonts::FreeSansBold12pt7b);
         gfx.drawString(labels[i], CX, y);
         if (s) gfx.drawString(">", CX - 104, y);
     }
@@ -165,7 +165,7 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, const char* 
     char fwbuf[16];
     snprintf(fwbuf, sizeof(fwbuf), "fw %d", fwVersion);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.drawString(fwbuf, CX, 212);
     gfx.pushSprite(0, 0);
 }
@@ -175,19 +175,19 @@ inline void drawParamPick(LGFX_Sprite& gfx, const ContinuousBinding* catalog, in
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("PARAMETER", CX, 38);
     int prev = (sel - 1 + count) % count;
     int next = (sel + 1) % count;
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString(catalog[prev].label, CX, CY - 42);
     gfx.drawString(catalog[next].label, CX, CY + 42);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(3);
+    gfx.setFont(&fonts::FreeSansBold18pt7b);
     gfx.drawString(catalog[sel].label, CX, CY);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.drawString("turn = change   click = save", CX, 208);
     gfx.pushSprite(0, 0);
 }
@@ -197,13 +197,13 @@ inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, 
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("SELECT WIFI", CX, 36);
     if (count <= 0) {
         gfx.setTextColor(COLOR_VALUE, COLOR_BG);
         gfx.drawString("no networks", CX, CY);
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-        gfx.setTextSize(1);
+        gfx.setFont(&fonts::FreeSansBold9pt7b);
         gfx.drawString("click = rescan", CX, 208);
         gfx.pushSprite(0, 0);
         return;
@@ -211,14 +211,14 @@ inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, 
     int prev = (sel - 1 + count) % count;
     int next = (sel + 1) % count;
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.drawString(ssids[prev], CX, CY - 38);
     gfx.drawString(ssids[next], CX, CY + 38);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString(ssids[sel], CX, CY);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     char foot[28];
     snprintf(foot, sizeof(foot), "%d/%d   click = select", sel + 1, count);
     gfx.drawString(foot, CX, 208);
@@ -231,21 +231,21 @@ inline void drawPasswordEntry(LGFX_Sprite& gfx, const char* ssid, const char* pw
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.drawString(ssid, CX, 26);
     // entered password so far (last 14 chars if long)
     int len = strlen(pw);
     const char* shown = (len > 14) ? pw + (len - 14) : pw;
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString(len ? shown : "( empty )", CX, CY - 42);
     // highlighted character / DEL
     gfx.setTextColor(COLOR_FALLBACK, COLOR_BG);
-    gfx.setTextSize(5);
+    gfx.setFont(&fonts::FreeSansBold24pt7b);
     gfx.drawString(curItem, CX, CY + 10);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
-    gfx.drawString("click = add   hold = connect", CX, 210);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.drawString("hold = back", CX, 206);
     gfx.pushSprite(0, 0);
 }
 
@@ -254,15 +254,15 @@ inline void drawConfigIdEdit(LGFX_Sprite& gfx, int value) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(2);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("DEVICE ID", CX, CY - 52);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.setTextSize(7);
+    gfx.setFont(&fonts::FreeSansBold24pt7b);
     char b[8];
     snprintf(b, sizeof(b), "%d", value);
     gfx.drawString(b, CX, CY + 2);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setTextSize(1);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.drawString("turn = change   click = save", CX, CY + 58);
     gfx.pushSprite(0, 0);
 }
