@@ -147,7 +147,8 @@ volatile bool libReqOk = false;             // net -> UI: it succeeded
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
 constexpr uint32_t ECHO_SUPPRESS_MS = 500;
-constexpr uint32_t LONG_PRESS_MS = 3000;   // hold to enter config / go back
+constexpr uint32_t LONG_PRESS_MS = 3000;     // hold to enter config / go back
+constexpr uint32_t CONFIG_TIMEOUT_MS = 45000; // config returns to the dial after this idle
 
 // ---- Shared state ----
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -571,23 +572,36 @@ void checkForUpdate(const char* reason) {
         snprintf(otaStatusMsg, sizeof(otaStatusMsg), "up to date (v%d)", remote);
         delay(1500); otaChecking = false; return;
     }
-    // Same cache-busting for the binary so we never flash a stale image.
-    url += (url.indexOf('?') >= 0 ? "&cb=" : "?cb=") + String((uint32_t)millis()) + String(random(1000000));
-
-    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "updating v%d", remote);
-    otaPercent = 0;
-    otaActive = true;       // UI switches to the progress ring
-    otaChecking = false;
-    NetworkClientSecure dlClient;
-    dlClient.setCACert(GITHUB_ROOTS);
     httpUpdate.rebootOnUpdate(true);
     httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     httpUpdate.onProgress([](int cur, int total) {
         otaPercent = total ? (int)((cur * 100L) / total) : 0;
     });
-    t_httpUpdate_return r = httpUpdate.update(dlClient, url);
-    // Only reached if the update did NOT succeed (success reboots into the new image).
-    otaActive = false;
+
+    // Download + flash, retrying on failure. A partial/aborted download (weak
+    // WiFi, AP contention) leaves the app intact — a fresh attempt usually
+    // succeeds. Each try uses a new TLS client + cache-buster so it can't resume
+    // a broken/stale transfer. A successful flash reboots into the new image.
+    t_httpUpdate_return r = HTTP_UPDATE_FAILED;
+    const int MAX_TRIES = 3;
+    for (int attempt = 1; attempt <= MAX_TRIES; ++attempt) {
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "updating v%d", remote);
+        otaPercent = 0;
+        otaActive = true;       // UI switches to the progress ring
+        otaChecking = false;
+        String dlUrl = url + (url.indexOf('?') >= 0 ? "&cb=" : "?cb=")
+                       + String((uint32_t)millis()) + String(random(1000000));
+        NetworkClientSecure dlClient;
+        dlClient.setCACert(GITHUB_ROOTS);
+        r = httpUpdate.update(dlClient, dlUrl);
+        // Only reached if the update did NOT succeed (success reboots).
+        otaActive = false;
+        if (attempt < MAX_TRIES) {
+            snprintf(otaStatusMsg, sizeof(otaStatusMsg), "retry %d/%d (e%d)",
+                     attempt + 1, MAX_TRIES, httpUpdate.getLastError());
+            otaChecking = true; delay(2000); otaChecking = false;
+        }
+    }
     snprintf(otaStatusMsg, sizeof(otaStatusMsg), "upd fail %d/%d h%uk",
              (int)r, httpUpdate.getLastError(), (unsigned)(ESP.getMaxAllocHeap() / 1024));
     otaChecking = true; delay(3000); otaChecking = false;
@@ -861,6 +875,18 @@ void loop() {
     }
     if (edelta != 0 || clicked || longPress) noteActivity();
 
+    // Config times out back to the dial after inactivity, so a board left in a
+    // menu returns to normal operation on its own. (lastActivityMs only advances
+    // on input while in config — no value/tuner changes happen on these screens.)
+    if (cfg != CFG_NONE && (millis() - lastActivityMs) > CONFIG_TIMEOUT_MS) {
+        cfg = CFG_NONE;
+        uiMode = UI_GAUGE;
+        lastRenderedValue = -999999.0f;
+        lastTunerCents = -999.0f;
+        vTaskDelay(pdMS_TO_TICKS(5));
+        return;
+    }
+
     // --- Config menu ---
     if (cfg == CFG_MENU) {
         if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
@@ -1064,9 +1090,10 @@ void loop() {
         int total = count + 1;   // +1 for the "< Back" row at index 0
         if (edelta != 0) { libSel = (((libSel + edelta) % total) + total) % total; libDirty = true; }
         if (clicked) {
-            if (libSel == 0) {                       // "< Back"
-                if (libState == LIB_RIGS) { libState = LIB_SETLISTS; libSel = 0; libDirty = true; }
-                else if (ringSize() > 1) {           // exit library -> next ring view
+            if (libSel == 0) {                       // back row
+                if (libState == LIB_RIGS) {          // rigs -> setlists
+                    libState = LIB_SETLISTS; libSel = 0; libDirty = true;
+                } else {                             // setlists -> exit to the next ring view
                     ringSlot = (ringSlot + 1) % ringSize();
                     applyView(ringSlot);
                     lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
@@ -1092,9 +1119,9 @@ void loop() {
         }
         if (libDirty) {
             if (libState == LIB_SETLISTS)
-                Render::drawListNav(canvas, "SETLISTS", libSetlistNames, libSetlistCount, libSel);
+                Render::drawListNav(canvas, "SETLISTS", "< Exit", libSetlistNames, libSetlistCount, libSel);
             else
-                Render::drawListNav(canvas, libSelSetlistName, libRigNames, libRigCount, libSel);
+                Render::drawListNav(canvas, libSelSetlistName, "< Setlists", libRigNames, libRigCount, libSel);
             libDirty = false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));

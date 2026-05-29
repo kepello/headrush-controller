@@ -146,10 +146,11 @@ inline void drawTuner(LGFX_Sprite& gfx, const char* note, float cents, uint16_t 
     gfx.pushSprite(0, 0);
 }
 
-// Generic drill-down list (Setlist / Rig browser): a spinner with "< Back" at
-// index 0 and items[0..count-1] at indices 1..count. Long names drop to a
-// smaller font. Title sits at the top, position at the bottom. UI task only.
-inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char items[][40], int count, int sel) {
+// Generic drill-down list (Setlist / Rig browser): a spinner with a back row at
+// index 0 (labeled by `backLabel`, e.g. "< Exit" or "< Setlists") and
+// items[0..count-1] at indices 1..count. Long names drop to a smaller font.
+// Title sits at the top, position at the bottom. UI task only.
+inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char* backLabel, const char items[][40], int count, int sel) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
@@ -157,7 +158,7 @@ inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char items[][
     gfx.drawString(title, CX, 30);
 
     int total = count + 1;
-    auto label = [&](int i) -> const char* { return (i == 0) ? "< Back" : items[i - 1]; };
+    auto label = [&](int i) -> const char* { return (i == 0) ? backLabel : items[i - 1]; };
     int prev = (sel - 1 + total) % total, next = (sel + 1) % total;
 
     gfx.setFont(&fonts::FreeSansBold9pt7b);
