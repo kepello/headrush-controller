@@ -501,9 +501,15 @@ void setup() {
     }
 
     prefs.begin("hrctrl", true);
-    deviceId = prefs.getInt("devid", 1);
+    deviceId = prefs.getInt("devid", 0);   // 0 = never provisioned
     paramIndex = prefs.getInt("param", 0);
     prefs.end();
+#ifdef PROVISION_ID
+    // Fleet provisioning: bake this unit's ID at flash time, but only if it
+    // hasn't been set yet — config-mode changes still win afterward.
+    if (deviceId == 0) { deviceId = PROVISION_ID; saveDeviceId(deviceId); }
+#endif
+    if (deviceId < 1 || deviceId > 16) deviceId = 1;
     if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
     activeBinding = &PARAM_CATALOG[paramIndex];
     Serial.printf("Device ID: %d, param %s\n", deviceId, activeBinding->label);
