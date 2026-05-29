@@ -18,6 +18,11 @@ void HeadRushClient::loop() {
     _ws.loop();
 }
 
+void HeadRushClient::stop() {
+    _ws.disconnect();
+    _wsConnected = false;
+}
+
 bool HeadRushClient::httpRequest(const char* method, const String& url, const String& body, JsonDocument* outDoc) {
     HTTPClient http;
     http.setReuse(true);

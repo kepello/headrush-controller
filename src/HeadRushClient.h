@@ -25,6 +25,7 @@ public:
 
     void begin(const String& host);
     void loop();
+    void stop();   // drop the WebSocket (frees its buffers) — used to reclaim heap for OTA TLS
 
     // HTTP — blocking. Returns true on 2xx.
     bool getProperties(const String& path, JsonDocument& out);

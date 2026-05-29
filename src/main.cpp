@@ -394,6 +394,16 @@ void checkForUpdate(const char* reason) {
     snprintf(otaStatusMsg, sizeof(otaStatusMsg), "checking...");
     otaChecking = true;
 
+    // Free the Prime WebSocket first. Verified TLS (mbedTLS) needs a large
+    // contiguous heap block for the handshake; after the controller has been
+    // running, the WS buffers fragment the heap enough that the TLS connection
+    // fails ("check failed -1") or the download dies ("update failed 0") — which
+    // is why a manual check fails but the same check at boot (clean heap) works.
+    // Dropping the WS reclaims that space; the net loop reconnects it afterward
+    // (or we reboot into the new image on success).
+    hr.stop();
+    delay(50);
+
     // Verified TLS needs a real clock; re-sync (with retries) if the boot sync
     // didn't take. NTP is often blocked and a one-shot HTTPS Date can miss.
     for (int i = 0; i < 3 && time(nullptr) < 1700000000; ++i)
@@ -418,7 +428,8 @@ void checkForUpdate(const char* reason) {
         if (code != HTTP_CODE_OK) delay(700);
     }
     if (code != HTTP_CODE_OK) {
-        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed (%d)", code);
+        snprintf(otaStatusMsg, sizeof(otaStatusMsg), "check failed %d h%uk",
+                 code, (unsigned)(ESP.getMaxAllocHeap() / 1024));
         delay(2500); otaChecking = false; return;
     }
 
@@ -448,7 +459,8 @@ void checkForUpdate(const char* reason) {
     t_httpUpdate_return r = httpUpdate.update(dlClient, url);
     // Only reached if the update did NOT succeed (success reboots into the new image).
     otaActive = false;
-    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "update failed %d", (int)r);
+    snprintf(otaStatusMsg, sizeof(otaStatusMsg), "upd fail %d/%d h%uk",
+             (int)r, httpUpdate.getLastError(), (unsigned)(ESP.getMaxAllocHeap() / 1024));
     otaChecking = true; delay(3000); otaChecking = false;
 }
 
