@@ -155,33 +155,44 @@ static int signalLevel(int rssi) {   // 0..4 bars
 volatile int deviceId = 1;
 int paramIndex = 0;
 // Config mode is a UI-task-local modal state, entered by a long (~5s) press.
-enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM, CFG_WIFI };
+enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_PARAM,
+                   CFG_WIFI, CFG_WIFI_PW, CFG_WIFI_CONNECTING };
 ConfigState cfg = CFG_NONE;
 int menuIndex = 0;
 int editIdValue = 1;
 int editParamValue = 0;
 
-// On-device WiFi setup: the net task scans, the UI picks. Scan results are char
-// buffers (not String) to keep cross-core sharing simple. Stage 2 adds the
-// password entry + connect using selectedSSID.
+// On-device WiFi setup: the net task scans/connects, the UI picks + types.
 volatile bool scanRequested = false;  // UI -> net: run a scan
 volatile bool scanDone = false;       // net -> UI: results ready
 volatile int  scanCount = 0;
 char scanSSIDs[16][33];
 int  wifiPickIndex = 0;
 char selectedSSID[33] = "";
+// Password entry (encoder character picker). Spinner item 0 = DEL, 1..N = chars.
+static const char PW_CHARS[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+=.,:;/?~ ";
+char wifiPassword[64] = "";
+int  pwIndex = 1;
+volatile bool wifiConnectRequested = false;  // UI -> net: try selectedSSID + wifiPassword
+volatile int  wifiConnectResult = 0;          // 0=pending, 1=success, 2=failed
+char wifiPassEntry[64] = "";                   // password handed to the net task
 
 struct WifiCreds { String ssid; String psk; String hostOverride; };
 
 WifiCreds loadCreds() {
     WifiCreds c;
-    if (strlen(WIFI_SSID) > 0) {
+    // On-device-saved creds (NVS) win — so a network configured on-device sticks
+    // across reboots and OTA. Fall back to compiled secrets.h only when NVS is
+    // empty, seeding it so OTA-delivered (CI) firmware can connect the first time.
+    prefs.begin("hrctrl", true);
+    c.ssid = prefs.getString("ssid", "");
+    c.psk = prefs.getString("psk", "");
+    c.hostOverride = prefs.getString("host", "");
+    prefs.end();
+    if (c.ssid.length() == 0 && strlen(WIFI_SSID) > 0) {
         c.ssid = WIFI_SSID;
         c.psk = WIFI_PSK;
         c.hostOverride = HEADRUSH_HOST_OVERRIDE;
-        // Seed NVS so OTA-delivered (CI) firmware — which has no compiled-in
-        // secrets.h — can still join WiFi. NVS survives OTA, so a single local
-        // flash provisions the unit for all future over-the-air updates.
         Preferences p;
         if (p.begin("hrctrl", false)) {
             p.putString("ssid", c.ssid);
@@ -189,13 +200,7 @@ WifiCreds loadCreds() {
             p.putString("host", c.hostOverride);
             p.end();
         }
-        return c;
     }
-    prefs.begin("hrctrl", true);
-    c.ssid = prefs.getString("ssid", "");
-    c.psk = prefs.getString("psk", "");
-    c.hostOverride = prefs.getString("host", "");
-    prefs.end();
     return c;
 }
 
@@ -418,6 +423,30 @@ void doWifiScan() {
     Serial.printf("[wifi] scan: %d networks\n", k);
 }
 
+// Try to join selectedSSID with the entered password (net task). On success,
+// persist the creds to NVS and reboot to re-init cleanly on the new network.
+void doWifiConnect() {
+    wifiConnectResult = 0;  // pending
+    WiFi.disconnect();
+    WiFi.begin(selectedSSID, wifiPassEntry);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(250);
+    if (WiFi.status() == WL_CONNECTED) {
+        Preferences p;
+        p.begin("hrctrl", false);
+        p.putString("ssid", selectedSSID);
+        p.putString("psk", wifiPassEntry);
+        p.end();
+        Serial.printf("[wifi] connected to %s, saved\n", selectedSSID);
+        wifiConnectResult = 1;
+        delay(800);
+        ESP.restart();
+    } else {
+        Serial.printf("[wifi] connect to %s failed\n", selectedSSID);
+        wifiConnectResult = 2;
+    }
+}
+
 void netTask(void*) {
     Serial.println("[net] starting");
     gHostname = makeHostname();
@@ -457,7 +486,8 @@ void netTask(void*) {
 
     uint32_t lastWriteMs = 0;
     while (true) {
-        if (scanRequested) { scanRequested = false; doWifiScan(); }  // works offline too
+        if (scanRequested) { scanRequested = false; doWifiScan(); }        // works offline too
+        if (wifiConnectRequested) { wifiConnectRequested = false; doWifiConnect(); }
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
@@ -627,14 +657,76 @@ void loop() {
         if (clicked) {
             strncpy(selectedSSID, scanSSIDs[wifiPickIndex], sizeof(selectedSSID)); selectedSSID[32] = 0;
             Serial.printf("[wifi] picked %s\n", selectedSSID);
-            cfg = CFG_MENU; shownPick = -2;  // Stage 2 will go to password entry instead
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            wifiPassword[0] = 0; pwIndex = 2; shownPick = -2;
+            cfg = CFG_WIFI_PW;
+            char ib[2] = { PW_CHARS[0], 0 };
+            Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) wifiPickIndex = (int)(((wifiPickIndex + edelta) % scanCount + scanCount) % scanCount);
         if (shownPick != wifiPickIndex) { shownPick = wifiPickIndex; Render::drawWifiPicker(canvas, scanSSIDs, scanCount, wifiPickIndex); }
         vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- WiFi password entry (encoder picker: 0=OK, 1=DEL, 2+=chars) ---
+    if (cfg == CFG_WIFI_PW) {
+        const int items = (int)strlen(PW_CHARS) + 2;
+        char itemBuf[4];
+        auto labelFor = [&](int idx) -> const char* {
+            if (idx == 0) return "OK";
+            if (idx == 1) return "DEL";
+            itemBuf[0] = PW_CHARS[idx - 2]; itemBuf[1] = 0; return itemBuf;
+        };
+        if (longPress) {  // cancel back to menu
+            cfg = CFG_MENU;
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, PARAM_CATALOG[paramIndex].label, FW_VERSION);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (clicked) {
+            if (pwIndex == 0) {  // OK -> attempt connect (net task)
+                strncpy(wifiPassEntry, wifiPassword, sizeof(wifiPassEntry)); wifiPassEntry[63] = 0;
+                wifiConnectResult = 0; wifiConnectRequested = true;
+                cfg = CFG_WIFI_CONNECTING;
+                Render::drawSplash(canvas, deviceId, FW_VERSION, "connecting");
+            } else if (pwIndex == 1) {  // DEL
+                int L = strlen(wifiPassword); if (L) wifiPassword[L - 1] = 0;
+                Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
+            } else {  // append char
+                int L = strlen(wifiPassword); if (L < 63) { wifiPassword[L] = PW_CHARS[pwIndex - 2]; wifiPassword[L + 1] = 0; }
+                Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            pwIndex = (int)(((pwIndex + edelta) % items + items) % items);
+            Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- WiFi connecting (net task attempts the join) ---
+    if (cfg == CFG_WIFI_CONNECTING) {
+        if (wifiConnectResult == 1) {  // success — net task reboots momentarily
+            Render::drawSplash(canvas, deviceId, FW_VERSION, "connected!");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            return;
+        }
+        if (wifiConnectResult == 2) {  // failed — back to password entry to retry
+            Render::drawSplash(canvas, deviceId, FW_VERSION, "connect failed");
+            delay(2500);
+            wifiConnectResult = 0; pwIndex = 2;
+            cfg = CFG_WIFI_PW;
+            char ib[2] = { PW_CHARS[0], 0 };
+            Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // pending ("connecting" already shown)
         return;
     }
 

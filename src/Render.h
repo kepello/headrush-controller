@@ -225,6 +225,30 @@ inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, 
     gfx.pushSprite(0, 0);
 }
 
+// WiFi password entry (encoder character picker). `curItem` is the currently
+// highlighted character (or "DEL"); `pw` is what's been typed so far.
+inline void drawPasswordEntry(LGFX_Sprite& gfx, const char* ssid, const char* pw, const char* curItem) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString(ssid, CX, 26);
+    // entered password so far (last 14 chars if long)
+    int len = strlen(pw);
+    const char* shown = (len > 14) ? pw + (len - 14) : pw;
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setTextSize(2);
+    gfx.drawString(len ? shown : "( empty )", CX, CY - 42);
+    // highlighted character / DEL
+    gfx.setTextColor(COLOR_FALLBACK, COLOR_BG);
+    gfx.setTextSize(5);
+    gfx.drawString(curItem, CX, CY + 10);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setTextSize(1);
+    gfx.drawString("click = add   hold = connect", CX, 210);
+    gfx.pushSprite(0, 0);
+}
+
 // Device-ID editor: big number, turn to change, click to save.
 inline void drawConfigIdEdit(LGFX_Sprite& gfx, int value) {
     gfx.fillScreen(COLOR_BG);
