@@ -91,13 +91,15 @@ const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 
 // View ring: a board cycles an ordered subset of views with a short click.
 // View indices 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; index PARAM_COUNT
-// is the Tuner view (no dial — a live note/cents gauge). viewMask bit i selects
-// view i for this board's ring. (Library/Setlist view comes later.)
+// is the Tuner view (live note/cents gauge); index PARAM_COUNT+1 is the Library
+// view (Setlist -> Rig browser). viewMask bit i selects view i for this board.
 const int TUNER_VIEW = PARAM_COUNT;
-const int VIEW_COUNT = PARAM_COUNT + 1;
+const int LIBRARY_VIEW = PARAM_COUNT + 1;
+const int VIEW_COUNT = PARAM_COUNT + 2;
 uint32_t viewMask = 0;
 int ringSlot = 0;        // which enabled view is currently shown
 inline bool viewIsTuner(int v) { return v == TUNER_VIEW; }
+inline bool viewIsLibrary(int v) { return v == LIBRARY_VIEW; }
 int ringSize() { int n = 0; for (int i = 0; i < VIEW_COUNT; ++i) if (viewMask & (1u << i)) n++; return n; }
 int ringViewAt(int slot) {  // view index of the slot-th enabled view (-1 if none)
     int seen = 0;
@@ -118,9 +120,33 @@ char tunerNote[8] = "--";               // net writes, UI reads (guarded by stat
 float lastTunerCents = -999.0f;         // UI redraw tracking
 char lastTunerNote[8] = "";
 
+// Library view shared state. A Setlist -> Rig browser. The UI task sets request
+// flags + selection ids; the net task fetches over HTTP and fills the name/id
+// buffers, then flips libReqDone. The request/done handshake orders access, so
+// the buffers need no mutex (same pattern as the WiFi scan). UUIDs are 36 chars.
+const char* LIB_SETLISTS_PATH = "/Evil/API/Setlists";
+const char* LIB_RIGS_PATH     = "/Evil/API/Rigs";
+const int LIB_MAX_SETLISTS = 16;
+const int LIB_MAX_RIGS = 48;
+char libSetlistNames[LIB_MAX_SETLISTS][40];
+char libSetlistIds[LIB_MAX_SETLISTS][40];
+int  libSetlistCount = 0;
+char libRigNames[LIB_MAX_RIGS][40];
+char libRigIds[LIB_MAX_RIGS][40];
+int  libRigCount = 0;
+char libSelSetlistId[40] = "";
+char libSelSetlistName[40] = "";
+char libSelRigId[40] = "";
+volatile bool libFetchSetlistsReq = false;  // UI -> net: load the setlist list
+volatile bool libFetchRigsReq = false;      // UI -> net: getSetlist(libSelSetlistId)
+volatile bool libLoadRigReq = false;        // UI -> net: loadRig(libSelRigId, libSelSetlistId)
+volatile bool libReqDone = false;           // net -> UI: last request finished
+volatile bool libReqOk = false;             // net -> UI: it succeeded
+
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
 constexpr uint32_t ECHO_SUPPRESS_MS = 500;
+constexpr uint32_t LONG_PRESS_MS = 3000;   // hold to enter config / go back
 
 // ---- Shared state ----
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -202,16 +228,33 @@ static int signalLevel(int rssi) {   // 0..4 bars
 volatile int deviceId = 1;
 int paramIndex = 0;
 
-// Make the given ring slot the current view. Tuner views just raise tunerActive
-// (the net task reconciles muting/polling); param views point activeBinding at
-// the catalog entry and ask the net task to re-prime. Called from the UI task.
+// Library navigator (UI-task-local). Setlist list, then a setlist's rigs.
+enum LibState { LIB_SETLISTS, LIB_RIGS };
+bool libActive = false;       // current view is the library browser
+LibState libState = LIB_SETLISTS;
+int  libSel = 0;              // cursor; 0 = "< Back", 1..count = entries
+bool libLoading = false;      // waiting on a net fetch/load
+bool libPendingLoad = false;  // the pending request is a loadRig (don't reset cursor on done)
+bool libDirty = false;        // a redraw is needed
+
+// Make the given ring slot the current view. Tuner raises tunerActive (the net
+// task reconciles muting/polling); Library raises libActive and kicks off a
+// setlist fetch; param views point activeBinding at the catalog entry. The net
+// task re-primes on rebindRequested. Called from the UI task only.
 void applyView(int slot) {
     int v = ringViewAt(slot);
     if (v < 0) v = 0;
+    tunerActive = false;
+    libActive = false;
     if (viewIsTuner(v)) {
         tunerActive = true;
+    } else if (viewIsLibrary(v)) {
+        libActive = true;
+        libState = LIB_SETLISTS;
+        libSel = 0;
+        libReqDone = false; libLoading = true; libPendingLoad = false; libDirty = true;
+        libFetchSetlistsReq = true;
     } else {
-        tunerActive = false;
         paramIndex = v;
         activeBinding = &PARAM_CATALOG[v];
     }
@@ -374,6 +417,65 @@ void serviceTuner() {
             portEXIT_CRITICAL(&stateMux);
         }
     }
+}
+
+// Library net-task helpers. Each fills shared buffers, then flips libReqDone.
+void doLibFetchSetlists() {
+    libReqOk = false;
+    libSetlistCount = 0;
+    JsonDocument doc;
+    if (hr.getProperties(LIB_SETLISTS_PATH, doc)) {
+        JsonArrayConst names = doc["SetlistNames"].as<JsonArrayConst>();
+        JsonArrayConst ids = doc["SetlistIds"].as<JsonArrayConst>();
+        int n = 0;
+        for (size_t i = 0; i < names.size() && i < ids.size() && n < LIB_MAX_SETLISTS; ++i) {
+            strncpy(libSetlistNames[n], names[i] | "", 39); libSetlistNames[n][39] = 0;
+            strncpy(libSetlistIds[n], ids[i] | "", 39);     libSetlistIds[n][39] = 0;
+            n++;
+        }
+        libSetlistCount = n;
+        libReqOk = (n > 0);
+    }
+    libReqDone = true;
+}
+
+void doLibFetchRigs() {
+    libReqOk = false;
+    libRigCount = 0;
+    JsonDocument args;
+    args.to<JsonArray>().add(libSelSetlistId);
+    JsonDocument res;
+    if (hr.callMethod(LIB_SETLISTS_PATH, "getSetlist", args.as<JsonVariantConst>(), res)) {
+        const char* s = res["methodReturnValue"] | "";
+        JsonDocument inner;
+        if (!deserializeJson(inner, s)) {
+            int n = 0;
+            // A setlist holds songs; each song holds rigs. Flatten to one rig list.
+            for (JsonObjectConst song : inner["songs"].as<JsonArrayConst>()) {
+                JsonArrayConst rn = song["rig_names"].as<JsonArrayConst>();
+                JsonArrayConst ri = song["rigs"].as<JsonArrayConst>();
+                for (size_t i = 0; i < ri.size() && n < LIB_MAX_RIGS; ++i) {
+                    strncpy(libRigNames[n], rn[i] | "", 39); libRigNames[n][39] = 0;
+                    strncpy(libRigIds[n], ri[i] | "", 39);   libRigIds[n][39] = 0;
+                    n++;
+                }
+            }
+            libRigCount = n;
+            libReqOk = (n > 0);
+        }
+    }
+    libReqDone = true;
+}
+
+void doLibLoadRig() {
+    JsonDocument args;
+    JsonArray a = args.to<JsonArray>();
+    a.add(libSelRigId);
+    a.add(libSelSetlistId);   // loadRig(rigId, srId) — srId is the setlist context
+    JsonDocument res;
+    bool ok = hr.callMethod(LIB_RIGS_PATH, "loadRig", args.as<JsonVariantConst>(), res);
+    libReqOk = ok && (res["methodReturnValue"] | false);
+    libReqDone = true;
 }
 
 // OTA. Set up once, after WiFi is up. mDNS is already running (resolveHost),
@@ -598,7 +700,10 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-            if (rebindRequested) { rebindRequested = false; if (!tunerActive) primeInitialValue(); }  // new view picked
+            if (rebindRequested) { rebindRequested = false; if (!tunerActive && !libActive) primeInitialValue(); }  // new view picked
+            if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
+            if (libFetchRigsReq)     { libFetchRigsReq = false; doLibFetchRigs(); }
+            if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
             hr.loop();
             serviceTuner();
             if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; wifiRssi = 0; }
@@ -721,11 +826,11 @@ void loop() {
         static bool fired = false;
         if (encoder.isEncoderButtonDown()) {
             if (down == 0) { down = millis(); fired = false; }
-            else if (!fired && millis() - down >= 4000) { longPress = true; fired = true; }
+            else if (!fired && millis() - down >= LONG_PRESS_MS) { longPress = true; fired = true; }
         } else {
             if (down != 0 && !fired) {
                 uint32_t held = millis() - down;
-                if (held >= 40 && held < 4000) clicked = true;  // debounced short press
+                if (held >= 40 && held < LONG_PRESS_MS) clicked = true;  // debounced short press
             }
             down = 0;
         }
@@ -744,7 +849,7 @@ void loop() {
         if (clicked) {
             if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
             else if (menuIndex == 1) { viewSel = 0; cfg = CFG_EDIT_VIEWS; Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask); }
-            else if (menuIndex == 2) { cfg = CFG_WIFI; wifiPickIndex = 0; scanDone = false; scanRequested = true; }  // scan starts
+            else if (menuIndex == 2) { cfg = CFG_WIFI; wifiPickIndex = 1; scanDone = false; scanRequested = true; }  // scan starts
             else if (menuIndex == 3) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -776,16 +881,22 @@ void loop() {
             return;
         }
         if (clicked) {
-            strncpy(selectedSSID, scanSSIDs[wifiPickIndex], sizeof(selectedSSID)); selectedSSID[32] = 0;
+            if (wifiPickIndex == 0) {  // "< Back" -> config menu
+                cfg = CFG_MENU; shownPick = -2;
+                Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                return;
+            }
+            strncpy(selectedSSID, scanSSIDs[wifiPickIndex - 1], sizeof(selectedSSID)); selectedSSID[32] = 0;
             Serial.printf("[wifi] picked %s\n", selectedSSID);
-            wifiPassword[0] = 0; pwIndex = 2; shownPick = -2;
+            wifiPassword[0] = 0; pwIndex = 3; shownPick = -2;
             cfg = CFG_WIFI_PW;
             char ib[2] = { PW_CHARS[0], 0 };
             Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
-        if (edelta != 0) wifiPickIndex = (int)(((wifiPickIndex + edelta) % scanCount + scanCount) % scanCount);
+        if (edelta != 0) { int total = scanCount + 1; wifiPickIndex = (int)(((wifiPickIndex + edelta) % total + total) % total); }
         if (shownPick != wifiPickIndex) { shownPick = wifiPickIndex; Render::drawWifiPicker(canvas, scanSSIDs, scanCount, wifiPickIndex); }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -793,12 +904,13 @@ void loop() {
 
     // --- WiFi password entry (encoder picker: 0=OK, 1=DEL, 2+=chars) ---
     if (cfg == CFG_WIFI_PW) {
-        const int items = (int)strlen(PW_CHARS) + 2;
+        const int items = (int)strlen(PW_CHARS) + 3;
         char itemBuf[4];
         auto labelFor = [&](int idx) -> const char* {
             if (idx == 0) return "OK";
             if (idx == 1) return "DEL";
-            itemBuf[0] = PW_CHARS[idx - 2]; itemBuf[1] = 0; return itemBuf;
+            if (idx == 2) return "Back";
+            itemBuf[0] = PW_CHARS[idx - 3]; itemBuf[1] = 0; return itemBuf;
         };
         if (longPress) {  // cancel back to menu
             cfg = CFG_MENU;
@@ -815,8 +927,11 @@ void loop() {
             } else if (pwIndex == 1) {  // DEL
                 int L = strlen(wifiPassword); if (L) wifiPassword[L - 1] = 0;
                 Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
+            } else if (pwIndex == 2) {  // Back -> config menu
+                cfg = CFG_MENU;
+                Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
             } else {  // append char
-                int L = strlen(wifiPassword); if (L < 63) { wifiPassword[L] = PW_CHARS[pwIndex - 2]; wifiPassword[L + 1] = 0; }
+                int L = strlen(wifiPassword); if (L < 63) { wifiPassword[L] = PW_CHARS[pwIndex - 3]; wifiPassword[L + 1] = 0; }
                 Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
             }
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -840,7 +955,7 @@ void loop() {
         if (wifiConnectResult == 2) {  // failed — back to password entry to retry
             Render::drawSplash(canvas, deviceId, FW_VERSION, "connect failed");
             delay(2500);
-            wifiConnectResult = 0; pwIndex = 2;
+            wifiConnectResult = 0; pwIndex = 3;
             cfg = CFG_WIFI_PW;
             char ib[2] = { PW_CHARS[0], 0 };
             Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
@@ -912,6 +1027,62 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
+    // --- Library view --- (Setlist -> Rig browser; click selects, not cycles)
+    if (libActive) {
+        if (libLoading) {
+            if (libReqDone) {
+                libReqDone = false;
+                libLoading = false;
+                if (!libPendingLoad) libSel = 0;   // land on "< Back" after a fresh list
+                libPendingLoad = false;
+                libDirty = true;
+            } else {
+                if (libDirty) { Render::drawListLoading(canvas, "loading..."); libDirty = false; }
+                vTaskDelay(pdMS_TO_TICKS(20));
+                return;
+            }
+        }
+        int count = (libState == LIB_SETLISTS) ? libSetlistCount : libRigCount;
+        int total = count + 1;   // +1 for the "< Back" row at index 0
+        if (edelta != 0) { libSel = (((libSel + edelta) % total) + total) % total; libDirty = true; }
+        if (clicked) {
+            if (libSel == 0) {                       // "< Back"
+                if (libState == LIB_RIGS) { libState = LIB_SETLISTS; libSel = 0; libDirty = true; }
+                else if (ringSize() > 1) {           // exit library -> next ring view
+                    ringSlot = (ringSlot + 1) % ringSize();
+                    applyView(ringSlot);
+                    lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    return;
+                }
+            } else if (libState == LIB_SETLISTS) {   // drill into a setlist's rigs
+                int idx = libSel - 1;
+                strncpy(libSelSetlistId, libSetlistIds[idx], sizeof(libSelSetlistId)); libSelSetlistId[39] = 0;
+                strncpy(libSelSetlistName, libSetlistNames[idx], sizeof(libSelSetlistName)); libSelSetlistName[39] = 0;
+                libState = LIB_RIGS;
+                libReqDone = false; libLoading = true; libPendingLoad = false; libDirty = true;
+                libFetchRigsReq = true;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                return;
+            } else {                                  // load the chosen rig
+                strncpy(libSelRigId, libRigIds[libSel - 1], sizeof(libSelRigId)); libSelRigId[39] = 0;
+                libReqDone = false; libLoading = true; libPendingLoad = true; libDirty = true;
+                libLoadRigReq = true;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                return;
+            }
+        }
+        if (libDirty) {
+            if (libState == LIB_SETLISTS)
+                Render::drawListNav(canvas, "SETLISTS", libSetlistNames, libSetlistCount, libSel);
+            else
+                Render::drawListNav(canvas, libSelSetlistName, libRigNames, libRigCount, libSel);
+            libDirty = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
     if (clicked && ringSize() > 1) {  // short click cycles to the next view in the ring
         ringSlot = (ringSlot + 1) % ringSize();
         applyView(ringSlot);

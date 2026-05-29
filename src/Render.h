@@ -146,6 +146,50 @@ inline void drawTuner(LGFX_Sprite& gfx, const char* note, float cents, uint16_t 
     gfx.pushSprite(0, 0);
 }
 
+// Generic drill-down list (Setlist / Rig browser): a spinner with "< Back" at
+// index 0 and items[0..count-1] at indices 1..count. Long names drop to a
+// smaller font. Title sits at the top, position at the bottom. UI task only.
+inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char items[][40], int count, int sel) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString(title, CX, 30);
+
+    int total = count + 1;
+    auto label = [&](int i) -> const char* { return (i == 0) ? "< Back" : items[i - 1]; };
+    int prev = (sel - 1 + total) % total, next = (sel + 1) % total;
+
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString(label(prev), CX, CY - 38);
+    gfx.drawString(label(next), CX, CY + 38);
+
+    const char* cur = label(sel);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(cur) > 9 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(cur, CX, CY);
+
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    char pos[16];
+    if (sel == 0) snprintf(pos, sizeof(pos), "click = back");
+    else          snprintf(pos, sizeof(pos), "%d / %d", sel, count);
+    gfx.drawString(pos, CX, 206);
+    gfx.pushSprite(0, 0);
+}
+
+// Simple centered status (e.g. "loading...") for the list browser while the net
+// task fetches/loads over HTTP. UI task only.
+inline void drawListLoading(LGFX_Sprite& gfx, const char* msg) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString(msg, CX, CY);
+    gfx.pushSprite(0, 0);
+}
+
 // Full-screen OTA progress: a ring that fills with the update percentage and a
 // big "NN%" readout. Call from the UI task only (same as drawContinuous).
 inline void drawOTAProgress(LGFX_Sprite& gfx, int percent) {
@@ -238,7 +282,8 @@ inline void drawViewSelect(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     int total = viewCount + 1;
     char pb[28], cb[28], nb[28];
     auto viewLabel = [&](int i) -> const char* {
-        return (i < paramCount) ? catalog[i].label : "Tuner";
+        if (i < paramCount) return catalog[i].label;
+        return (i == paramCount) ? "Tuner" : "Library";
     };
     auto fill = [&](int i, char* buf) {
         if (i >= viewCount) snprintf(buf, 28, "done");
@@ -275,19 +320,22 @@ inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, 
         gfx.pushSprite(0, 0);
         return;
     }
-    int prev = (sel - 1 + count) % count;
-    int next = (sel + 1) % count;
+    int total = count + 1;   // index 0 = "< Back", 1..count = networks
+    auto label = [&](int i) -> const char* { return (i == 0) ? "< Back" : ssids[i - 1]; };
+    int prev = (sel - 1 + total) % total;
+    int next = (sel + 1) % total;
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.drawString(ssids[prev], CX, CY - 38);
-    gfx.drawString(ssids[next], CX, CY + 38);
+    gfx.drawString(label(prev), CX, CY - 38);
+    gfx.drawString(label(next), CX, CY + 38);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString(ssids[sel], CX, CY);
+    gfx.drawString(label(sel), CX, CY);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold9pt7b);
     char foot[28];
-    snprintf(foot, sizeof(foot), "%d/%d   click = select", sel + 1, count);
+    if (sel == 0) snprintf(foot, sizeof(foot), "click = back");
+    else          snprintf(foot, sizeof(foot), "%d/%d   click = select", sel, count);
     gfx.drawString(foot, CX, 208);
     gfx.pushSprite(0, 0);
 }
