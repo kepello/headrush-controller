@@ -359,41 +359,28 @@ inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     gfx.pushSprite(0, 0);
 }
 
-// Scroll-list value (Setlist / Rig knob): the current item big in the middle,
-// neighbors dimmed above/below, position at the bottom. Status + group dots.
-// No back row, no instructions.
+// Scroll-list value (Setlist / Rig knob): just the title and the current item,
+// laid out exactly like a dial (title at CY-50, value at CY+4). Status + group
+// dots. No neighbors, no position, no instructions.
 inline void drawScrollList(LGFX_Sprite& gfx, const char* title, const char names[][40], int count, int sel, uint16_t statusDot, int sigLevel, int groupLen = 1, int groupFocus = 0) {
     gfx.fillScreen(COLOR_BG);
     drawStatusIndicators(gfx, statusDot, sigLevel);
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString(title, CX, CY - 56);
-    if (count <= 0) { gfx.pushSprite(0, 0); return; }
+    gfx.drawString(title, CX, CY - 50);
 
-    if (count > 1) {
-        int prev = (sel - 1 + count) % count, next = (sel + 1) % count;
-        gfx.setFont(&fonts::FreeSansBold9pt7b);
-        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-        gfx.drawString(names[prev], CX, CY - 26);
-        gfx.drawString(names[next], CX, CY + 26);
-    }
-    const char* cur = names[sel];
+    const char* cur = (count > 0 && sel >= 0 && sel < count) ? names[sel] : "--";
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.setFont(strlen(cur) > 9 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
-    gfx.drawString(cur, CX, CY);
-
-    gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    char pos[16]; snprintf(pos, sizeof(pos), "%d / %d", sel + 1, count);
-    gfx.drawString(pos, CX, CY + 52);
+    gfx.drawString(cur, CX, CY + 4);
 
     if (groupLen > 1) {
         int n = groupLen > 8 ? 8 : groupLen;
         constexpr int gap = 12;
         int x0 = CX - (n - 1) * gap / 2;
         for (int i = 0; i < n; ++i)
-            gfx.fillCircle(x0 + i * gap, CY + 72, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
+            gfx.fillCircle(x0 + i * gap, CY + 66, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
     }
     gfx.pushSprite(0, 0);
 }
