@@ -28,7 +28,7 @@ Prime's own 3 macro encoders require crouching).
 |---|---|
 | **Turn** | *Move*: change the focused value, or move the list cursor. Value edits are live (written to the Prime immediately). |
 | **Click** (short) | *Advance focus*: in a list, enter/select the highlighted item; on Home, cycle to the next control in the knob's group. |
-| **Double-click** | *The focused member's action* (Home only): for an effect control, toggle its block's bypass; for a Rigs/Setlists control, open the browser. No-op for globals/EQ/tuner that have neither. |
+| **Double-click** | *Bypass* (Home only): toggle the focused effect control's block. No-op for globals/EQ/tuner/Setlist/Rig (nothing to bypass). |
 | **Hold** (~1 s) | *Back*: up one level. At a board's Home screen, "up" opens the Board Menu. |
 
 Each gesture has exactly one meaning — no precedence rules. Turn never changes
@@ -55,16 +55,18 @@ HOME  ─ this board's assigned control/group for the loaded rig
 │
 └─ BOARD MENU            (hold from Home)
    ├─ Assign this knob → …   multi-select from controls AVAILABLE IN THE LOADED RIG
-   │                          (dials, Tuner, Rigs/Setlists — pick one or form an ordered group)
+   │                          (dials, Tuner, Setlist, Rig — pick one or form an ordered group)
    └─ Settings →             device/global: ID, WiFi, firmware, mic strip, rename/save…
 ```
 
-**Control types are assignable, not menu destinations.** Tuner and Rigs/Setlists
-aren't fixed menu items — they're control *types* in the Assign list, so a knob
-can BE the tuner or the rig browser (and can sit in a group with dials). A
-Rigs/Setlists knob shows a current rig/setlist readout at Home; **double-click
-opens the browser** (then turn=move, click=select/load, hold=back up a level →
-back to the readout). All sub-screens obey the same grammar.
+**Control types are assignable, not menu destinations.** Tuner, **Setlist**, and
+**Rig** aren't fixed menu items — they're control *types* in the Assign list, so a
+knob can BE the setlist selector or rig selector (and can sit in a group with
+dials). **Setlist and Rig are scroll-to-select lists**: the Home screen shows the
+current item; **turn scrolls** the names and, after a brief pause (~0.6 s) on one,
+that item is **loaded** — no click-to-select, no drill-down, no back row. Single-
+click still cycles group members. (Rig scrolls the current setlist's rigs; Setlist
+scrolls all setlists and loading one switches the active setlist.)
 
 ## 5. Per-rig dynamic layout (the core idea)
 

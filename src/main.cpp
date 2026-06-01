@@ -90,14 +90,17 @@ const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);
 // short click (cycle) or config swaps the pointer.
 const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 
-// View indices: 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; PARAM_COUNT is the
-// Tuner view. A board's Home carries an ordered group of these (see homeGroup).
-// LIBRARY_VIEW is a Board-Menu destination, not something assigned to the knob.
-const int TUNER_VIEW = PARAM_COUNT;
-const int LIBRARY_VIEW = PARAM_COUNT + 1;
-const int VIEW_COUNT = PARAM_COUNT + 2;
-inline bool viewIsTuner(int v) { return v == TUNER_VIEW; }
-inline bool viewIsLibrary(int v) { return v == LIBRARY_VIEW; }
+// View indices: 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; then Tuner,
+// Setlist, and Rig. A board's Home carries an ordered group of these. Setlist
+// and Rig are scroll-to-select lists (turn scrolls names, a pause loads).
+const int TUNER_VIEW   = PARAM_COUNT;
+const int SETLIST_VIEW = PARAM_COUNT + 1;
+const int RIG_VIEW     = PARAM_COUNT + 2;
+const int VIEW_COUNT   = PARAM_COUNT + 3;
+inline bool viewIsTuner(int v)   { return v == TUNER_VIEW; }
+inline bool viewIsSetlist(int v) { return v == SETLIST_VIEW; }
+inline bool viewIsRig(int v)     { return v == RIG_VIEW; }
+inline bool viewIsList(int v)    { return v == SETLIST_VIEW || v == RIG_VIEW; }
 
 // Tuner view shared state. The UI task sets tunerActive when the current ring
 // slot is the Tuner; the net task then mutes the Prime (user's choice) and polls
@@ -125,22 +128,30 @@ char libSetlistIds[LIB_MAX_SETLISTS][40];
 int  libSetlistCount = 0;
 char libRigNames[LIB_MAX_RIGS][40];
 char libRigIds[LIB_MAX_RIGS][40];
+char libRigSrIds[LIB_MAX_RIGS][40];          // setlist-id context per rig (loadRig needs it)
 int  libRigCount = 0;
 char libSelSetlistId[40] = "";
-char libSelSetlistName[40] = "";
 char libSelRigId[40] = "";
 volatile bool libFetchSetlistsReq = false;  // UI -> net: load the setlist list
-volatile bool libFetchRigsReq = false;      // UI -> net: getSetlist(libSelSetlistId)
+volatile bool fetchRigListReq = false;      // UI -> net: load the current setlist's rig list
+volatile bool loadSetlistReq = false;       // UI -> net: loadSetlist(libSelSetlistId)
 volatile bool libLoadRigReq = false;        // UI -> net: loadRig(libSelRigId, libSelSetlistId)
-volatile bool libFetchCurrentReq = false;   // UI -> net: read the current rig name for the idle display
 volatile bool libReqDone = false;           // net -> UI: last request finished
 volatile bool libReqOk = false;             // net -> UI: it succeeded
-// Currently-loaded rig / setlist (Prime's view); shown on the library idle display.
-// Net writes (HTTP fetch on entry / WS push when the Prime swaps a rig); UI reads.
+// Currently-loaded rig / setlist (Prime's view). Net writes (HTTP fetch / WS push
+// when the Prime swaps a rig); UI reads.
 char libCurrentRigName[40] = "";
+char libCurrentRigId[40] = "";
 char libCurrentSetlistName[40] = "";
-char lastLibIdleRig[40] = "?";              // UI render cache (forces first draw)
-char lastLibIdleSetlist[40] = "?";
+
+// Scroll-list Home state (Setlist / Rig knob types). turn scrolls the fetched
+// names; after a pause the highlighted item is loaded. UI-task-local.
+constexpr uint32_t LIST_COMMIT_MS = 600;    // pause before a scrolled item loads
+int  listCursor = 0;
+int  listCommitted = -1;                    // last loaded index (avoids reloading)
+uint32_t lastListScrollMs = 0;
+bool listLoading = false;
+bool listDirty = false;
 
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
@@ -234,35 +245,22 @@ int paramIndex = 0;   // catalog index of the currently focused Home member
 int  homeGroup[VIEW_COUNT] = { 0 };
 int  homeGroupLen = 1;
 int  homeFocus = 0;
-volatile bool homeLibraryIdle = false;   // focused Home member is Rigs/Setlists (net task reads it)
+volatile bool homeListActive = false;   // focused Home member is Setlist/Rig (net task reads it)
 
-// Library navigator (UI-task-local). Setlist list, then a setlist's rigs.
-// LIB_IDLE is the default — just shows the currently-loaded rig, like a dial.
-// Any encoder input enters LIB_SETLISTS; after a spell with no input we return.
-enum LibState { LIB_IDLE, LIB_SETLISTS, LIB_RIGS };
-bool libActive = false;       // current view is the library browser
-LibState libState = LIB_IDLE;
-int  libSel = 0;              // cursor; 0 = "< Back", 1..count = entries
-bool libLoading = false;      // waiting on a net fetch/load
-bool libPendingLoad = false;  // the pending request is a loadRig (don't reset cursor on done)
-bool libDirty = false;        // a redraw is needed
-
-// Point the net task at a single control (a param dial or the tuner). Tuner
-// raises tunerActive (the net task reconciles muting/polling); a param view
-// points activeBinding at the catalog entry. rebindRequested makes the net task
-// re-prime the value. Called from the UI task only.
+// Point the net task at the focused Home member. Tuner raises tunerActive; a
+// Setlist/Rig list raises homeListActive and kicks off its fetch; a param view
+// points activeBinding at the catalog entry. rebindRequested re-primes. UI task only.
 void bindControl(int v) {
     tunerActive = false;
-    libActive = false;
-    homeLibraryIdle = false;
+    homeListActive = false;
     if (viewIsTuner(v)) {
         tunerActive = true;
-    } else if (viewIsLibrary(v)) {
-        homeLibraryIdle = true;            // Home shows the rig/setlist readout
-        lastLibIdleRig[0] = '?'; lastLibIdleRig[1] = 0;
-        lastLibIdleSetlist[0] = '?'; lastLibIdleSetlist[1] = 0;
-        libFetchCurrentReq = true;         // populate the readout
-        libFetchSetlistsReq = true;        // pre-warm so opening the browser is instant
+    } else if (viewIsList(v)) {
+        homeListActive = true;
+        listCursor = 0; listCommitted = -1; listDirty = true; listLoading = true;
+        libReqDone = false;
+        if (viewIsSetlist(v)) libFetchSetlistsReq = true;
+        else                  fetchRigListReq = true;
     } else {
         if (v < 0 || v >= PARAM_COUNT) v = 0;
         paramIndex = v;
@@ -278,27 +276,13 @@ void focusHomeMember(int i) {
     bindControl(homeGroup[homeFocus]);
 }
 
-// Enter the Rigs/Setlists browser (a Board-Menu destination). Starts at the
-// setlist list and kicks off the fetch. Called from the UI task only.
-void enterLibrary() {
-    tunerActive = false;
-    libActive = true;
-    libState = LIB_SETLISTS;
-    libSel = 0;
-    libReqDone = false; libPendingLoad = false; libDirty = true;
-    libLoading = (libSetlistCount == 0);
-    libFetchSetlistsReq = true;
-    libFetchCurrentReq = true;
-}
-
 // UI screen model. Every screen obeys the universal grammar: turn = move,
 // single-click = enter/next, double-click = bypass (Home only), hold = back.
 // Parent links are fixed (handled inline at each screen); the tree is shallow.
 enum Screen {
-    SC_HOME,            // the assigned knob: value group or tuner
+    SC_HOME,            // the assigned knob: value group, tuner, or scroll-list
     SC_BOARD_MENU,      // hold from Home
     SC_ASSIGN,          // multi-select the Home group
-    SC_RIGS,            // Rigs/Setlists browser (libActive)
     SC_SETTINGS,        // device/global config menu
     SC_SET_ID,
     SC_WIFI, SC_WIFI_PW, SC_WIFI_CONNECTING
@@ -503,44 +487,43 @@ void doLibFetchSetlists() {
     libReqDone = true;
 }
 
-// Read the currently-loaded rig's name for the library idle display.
-void doLibFetchCurrent() {
+// Fetch the current setlist's rig list (names/ids/srIds) plus the loaded rig.
+void doFetchRigList() {
+    libReqOk = false;
+    libRigCount = 0;
     JsonDocument doc;
-    if (hr.getProperties("/Evil/Engine/Patch/Rig", doc)) {
-        const char* nm = doc["PresetName"] | "";
+    if (hr.getProperties(LIB_RIGS_PATH, doc)) {
+        JsonArrayConst names = doc["RigNames"].as<JsonArrayConst>();
+        JsonArrayConst ids   = doc["RigIds"].as<JsonArrayConst>();
+        JsonArrayConst sr    = doc["RigSrIds"].as<JsonArrayConst>();
+        int n = 0;
+        for (size_t i = 0; i < names.size() && i < ids.size() && n < LIB_MAX_RIGS; ++i) {
+            strncpy(libRigNames[n], names[i] | "", 39); libRigNames[n][39] = 0;
+            strncpy(libRigIds[n], ids[i] | "", 39);     libRigIds[n][39] = 0;
+            strncpy(libRigSrIds[n], (i < sr.size() ? (sr[i] | "") : ""), 39); libRigSrIds[n][39] = 0;
+            n++;
+        }
+        libRigCount = n;
+        libReqOk = (n > 0);
+        const char* nm = doc["loadedName"] | "";
+        const char* id = doc["loadedID"] | "";
         portENTER_CRITICAL(&stateMux);
         strncpy(libCurrentRigName, nm, 39); libCurrentRigName[39] = 0;
+        strncpy(libCurrentRigId, id, 39);   libCurrentRigId[39] = 0;
         portEXIT_CRITICAL(&stateMux);
     }
     libReqDone = true;
-    libReqOk = true;
 }
 
-void doLibFetchRigs() {
-    libReqOk = false;
-    libRigCount = 0;
+// Load the setlist whose id is in libSelSetlistId.
+void doLoadSetlist() {
     JsonDocument args;
-    args.to<JsonArray>().add(libSelSetlistId);
+    JsonArray a = args.to<JsonArray>();
+    a.add(libSelSetlistId);
+    a.add(true);   // 2nd arg (boolean) — best-guess; adjust if it misbehaves
     JsonDocument res;
-    if (hr.callMethod(LIB_SETLISTS_PATH, "getSetlist", args.as<JsonVariantConst>(), res)) {
-        const char* s = res["methodReturnValue"] | "";
-        JsonDocument inner;
-        if (!deserializeJson(inner, s)) {
-            int n = 0;
-            // A setlist holds songs; each song holds rigs. Flatten to one rig list.
-            for (JsonObjectConst song : inner["songs"].as<JsonArrayConst>()) {
-                JsonArrayConst rn = song["rig_names"].as<JsonArrayConst>();
-                JsonArrayConst ri = song["rigs"].as<JsonArrayConst>();
-                for (size_t i = 0; i < ri.size() && n < LIB_MAX_RIGS; ++i) {
-                    strncpy(libRigNames[n], rn[i] | "", 39); libRigNames[n][39] = 0;
-                    strncpy(libRigIds[n], ri[i] | "", 39);   libRigIds[n][39] = 0;
-                    n++;
-                }
-            }
-            libRigCount = n;
-            libReqOk = (n > 0);
-        }
-    }
+    bool ok = hr.callMethod(LIB_SETLISTS_PATH, "loadSetlist", args.as<JsonVariantConst>(), res);
+    libReqOk = ok && (res["methodReturnValue"] | false);
     libReqDone = true;
 }
 
@@ -807,11 +790,11 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-            if (rebindRequested) { rebindRequested = false; if (!tunerActive && !libActive && !homeLibraryIdle) primeInitialValue(); }  // new view picked
+            if (rebindRequested) { rebindRequested = false; if (!tunerActive && !homeListActive) primeInitialValue(); }  // new control focused
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
-            if (libFetchRigsReq)     { libFetchRigsReq = false; doLibFetchRigs(); }
+            if (fetchRigListReq)     { fetchRigListReq = false; doFetchRigList(); }
+            if (loadSetlistReq)      { loadSetlistReq = false; doLoadSetlist(); }
             if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
-            if (libFetchCurrentReq)  { libFetchCurrentReq = false; doLibFetchCurrent(); }
             if (bypassToggleReq) {   // Phase 1 stub — Phase 2 toggles the block's enable on the Prime
                 bypassToggleReq = false;
                 Serial.printf("[bypass] toggle requested for %s (stub — not yet wired)\n", activeBinding->label);
@@ -877,7 +860,7 @@ void setup() {
     int n = 0;
     for (int i = 0; i < homeGroupLen && i < VIEW_COUNT; ++i) {
         int v = homeGroup[i];
-        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW || v == LIBRARY_VIEW) homeGroup[n++] = v;
+        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW || v == SETLIST_VIEW || v == RIG_VIEW) homeGroup[n++] = v;
     }
     homeGroupLen = (n > 0) ? n : 1;
     if (n == 0) homeGroup[0] = 0;
@@ -1017,9 +1000,10 @@ void loop() {
 
     // --- Assign this knob (multi-select -> ordered Home group) ---
     if (screen == SC_ASSIGN) {
-        const int items = PARAM_COUNT + 2;   // dials, then Tuner, then Rigs/Setlists
+        const int items = PARAM_COUNT + 3;   // dials, Tuner, Setlist, Rig
         int cursorView = (assignCursor < PARAM_COUNT) ? assignCursor
-                        : (assignCursor == PARAM_COUNT) ? TUNER_VIEW : LIBRARY_VIEW;
+                        : (assignCursor == PARAM_COUNT) ? TUNER_VIEW
+                        : (assignCursor == PARAM_COUNT + 1) ? SETLIST_VIEW : RIG_VIEW;
         if (longPress) {                      // confirm the group, back to Home
             if (assignSelLen > 0) {
                 homeGroupLen = assignSelLen;
@@ -1198,82 +1182,6 @@ void loop() {
         return;
     }
 
-    // --- Rigs / Setlists browser (a Board-Menu destination) ---
-    if (screen == SC_RIGS) {
-        // Consume any completed background fetch / load.
-        if (libReqDone) {
-            libReqDone = false;
-            bool wasLoad = libPendingLoad; libPendingLoad = false;
-            libLoading = false;
-            if (wasLoad) {                       // a rig was loaded — return to the knob
-                libActive = false;
-                screen = SC_HOME; focusHomeMember(homeFocus);
-                lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
-                vTaskDelay(pdMS_TO_TICKS(5));
-                return;
-            }
-            libSel = 0; libDirty = true;
-        }
-        if (libLoading) {
-            if (libDirty) { Render::drawListLoading(canvas, "loading..."); libDirty = false; }
-            vTaskDelay(pdMS_TO_TICKS(20));
-            return;
-        }
-        int count = (libState == LIB_SETLISTS) ? libSetlistCount : libRigCount;
-        int total = count + 1;   // +1 for the back row at index 0
-        // hold = back one level (rigs -> setlists; setlists -> Home readout)
-        if (longPress) {
-            if (libState == LIB_RIGS) { libState = LIB_SETLISTS; libSel = 0; libDirty = true; }
-            else {
-                libActive = false; screen = SC_HOME; focusHomeMember(homeFocus);
-                lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
-                vTaskDelay(pdMS_TO_TICKS(5));
-                return;
-            }
-        }
-        if (edelta != 0) { libSel = (((libSel + edelta) % total) + total) % total; libDirty = true; }
-        if (clicked) {
-            if (libSel == 0) {                       // back row
-                if (libState == LIB_RIGS) {          // rigs -> setlists
-                    libState = LIB_SETLISTS; libSel = 0; libDirty = true;
-                } else {                             // setlists -> Home readout
-                    libActive = false; screen = SC_HOME; focusHomeMember(homeFocus);
-                    lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                    return;
-                }
-            } else if (libState == LIB_SETLISTS) {   // drill into a setlist's rigs
-                int idx = libSel - 1;
-                strncpy(libSelSetlistId, libSetlistIds[idx], sizeof(libSelSetlistId)); libSelSetlistId[39] = 0;
-                strncpy(libSelSetlistName, libSetlistNames[idx], sizeof(libSelSetlistName)); libSelSetlistName[39] = 0;
-                libState = LIB_RIGS;
-                libReqDone = false; libLoading = true; libPendingLoad = false; libDirty = true;
-                libFetchRigsReq = true;
-                vTaskDelay(pdMS_TO_TICKS(10));
-                return;
-            } else {                                  // load the chosen rig
-                int idx = libSel - 1;
-                strncpy(libSelRigId, libRigIds[idx], sizeof(libSelRigId)); libSelRigId[39] = 0;
-                portENTER_CRITICAL(&stateMux);
-                strncpy(libCurrentRigName, libRigNames[idx], 39); libCurrentRigName[39] = 0;
-                portEXIT_CRITICAL(&stateMux);
-                libReqDone = false; libLoading = true; libPendingLoad = true; libDirty = true;
-                libLoadRigReq = true;
-                vTaskDelay(pdMS_TO_TICKS(10));
-                return;
-            }
-        }
-        if (libDirty) {
-            if (libState == LIB_SETLISTS)
-                Render::drawListNav(canvas, "SETLISTS", "< Back", libSetlistNames, libSetlistCount, libSel);
-            else if (libState == LIB_RIGS)
-                Render::drawListNav(canvas, libSelSetlistName, "< Setlists", libRigNames, libRigCount, libSel);
-            libDirty = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-        return;
-    }
-
     // ============================ HOME ============================
     // hold opens the Board Menu.
     if (longPress) {
@@ -1289,36 +1197,74 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(5));
         return;
     }
-    // double-click = the focused member's action: open the browser for a
-    // Rigs/Setlists knob, else toggle the focused effect block's bypass (Phase 2
-    // wires the real Prime call; for now flag it for the net task to log).
-    if (doubleClick) {
-        if (homeLibraryIdle) {
-            enterLibrary(); screen = SC_RIGS;
-            vTaskDelay(pdMS_TO_TICKS(5));
-            return;
-        } else if (!tunerActive) {
-            bypassToggleReq = true;
-        }
+    // double-click = the focused member's action: toggle the focused effect
+    // block's bypass (Phase 2 wires the real call). No-op for tuner/list types.
+    if (doubleClick && !tunerActive && !homeListActive) {
+        bypassToggleReq = true;
     }
 
-    // --- Rigs/Setlists Home readout --- (double-click opens the browser)
-    if (homeLibraryIdle) {
-        char rig[40], slist[40];
-        portENTER_CRITICAL(&stateMux);
-        strncpy(rig, libCurrentRigName, 40); rig[39] = 0;
-        strncpy(slist, libCurrentSetlistName, 40); slist[39] = 0;
-        portEXIT_CRITICAL(&stateMux);
+    // --- Setlist / Rig scroll-list Home --- turn scrolls the names; after a
+    // brief pause the highlighted item is loaded (no click-to-select).
+    if (homeListActive) {
+        bool isSet = viewIsSetlist(homeGroup[homeFocus]);
+        if (libReqDone) {                 // a fetch/load finished: sync cursor to the loaded item
+            libReqDone = false;
+            listLoading = false;
+            int cnt = isSet ? libSetlistCount : libRigCount;
+            int cur = 0;
+            if (isSet) {
+                char nm[40]; portENTER_CRITICAL(&stateMux); strncpy(nm, libCurrentSetlistName, 40); portEXIT_CRITICAL(&stateMux); nm[39] = 0;
+                for (int i = 0; i < cnt; ++i) if (strcmp(libSetlistNames[i], nm) == 0) { cur = i; break; }
+            } else {
+                char id[40]; portENTER_CRITICAL(&stateMux); strncpy(id, libCurrentRigId, 40); portEXIT_CRITICAL(&stateMux); id[39] = 0;
+                for (int i = 0; i < cnt; ++i) if (strcmp(libRigIds[i], id) == 0) { cur = i; break; }
+            }
+            listCursor = cur; listCommitted = cur; listDirty = true;
+        }
+        if (listLoading) {
+            if (listDirty) { Render::drawListLoading(canvas, "loading..."); listDirty = false; }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            return;
+        }
+        int count = isSet ? libSetlistCount : libRigCount;
+        if (count <= 0) {
+            if (listDirty) { Render::drawListLoading(canvas, isSet ? "no setlists" : "no rigs"); listDirty = false; }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            return;
+        }
+        if (listCursor >= count) listCursor = count - 1;
+        if (edelta != 0) {
+            listCursor = (((listCursor + edelta) % count) + count) % count;
+            lastListScrollMs = millis();
+            listDirty = true;
+        }
+        // Pause-commit: a moment after the last turn, load the highlighted item.
+        if (listCursor != listCommitted && (millis() - lastListScrollMs) > LIST_COMMIT_MS) {
+            listCommitted = listCursor;
+            if (isSet) {
+                strncpy(libSelSetlistId, libSetlistIds[listCursor], sizeof(libSelSetlistId)); libSelSetlistId[39] = 0;
+                portENTER_CRITICAL(&stateMux);
+                strncpy(libCurrentSetlistName, libSetlistNames[listCursor], 39); libCurrentSetlistName[39] = 0;
+                portEXIT_CRITICAL(&stateMux);
+                loadSetlistReq = true;
+            } else {
+                strncpy(libSelRigId, libRigIds[listCursor], sizeof(libSelRigId)); libSelRigId[39] = 0;
+                strncpy(libSelSetlistId, libRigSrIds[listCursor], sizeof(libSelSetlistId)); libSelSetlistId[39] = 0;
+                portENTER_CRITICAL(&stateMux);
+                strncpy(libCurrentRigName, libRigNames[listCursor], 39); libCurrentRigName[39] = 0;
+                strncpy(libCurrentRigId, libRigIds[listCursor], 39);     libCurrentRigId[39] = 0;
+                portEXIT_CRITICAL(&stateMux);
+                libLoadRigReq = true;
+            }
+            noteActivity();
+        }
         uint16_t sc = statusColor(connStatus);
         int sl = signalLevel(wifiRssi);
-        bool nameChanged = strcmp(rig, lastLibIdleRig) != 0 || strcmp(slist, lastLibIdleSetlist) != 0;
-        if (nameChanged) noteActivity();   // an external rig change wakes the screen
-        if (nameChanged || sc != lastStatusColor || sl != lastSignalLevel || lastRenderedValue == -999999.0f) {
-            Render::drawLibraryIdle(canvas, rig, slist, sc, sl, homeGroupLen, homeFocus);
-            strncpy(lastLibIdleRig, rig, 40); lastLibIdleRig[39] = 0;
-            strncpy(lastLibIdleSetlist, slist, 40); lastLibIdleSetlist[39] = 0;
-            lastStatusColor = sc; lastSignalLevel = sl;
-            lastRenderedValue = 0;   // mark drawn (clear the force-redraw sentinel)
+        if (listDirty || sc != lastStatusColor || sl != lastSignalLevel) {
+            Render::drawScrollList(canvas, isSet ? "SETLIST" : "RIG",
+                                   isSet ? libSetlistNames : libRigNames, count, listCursor,
+                                   sc, sl, homeGroupLen, homeFocus);
+            lastStatusColor = sc; lastSignalLevel = sl; listDirty = false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;

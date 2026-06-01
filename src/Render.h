@@ -311,7 +311,7 @@ inline void drawSimpleMenu(LGFX_Sprite& gfx, const char* title, const char* cons
 // Board Menu (hold from Home): the top-level destinations.
 inline void drawBoardMenu(LGFX_Sprite& gfx, int sel) {
     static const char* const labels[2] = { "Assign knob", "Settings" };
-    drawSimpleMenu(gfx, "MENU", labels, 2, sel, "hold = back");
+    drawSimpleMenu(gfx, "MENU", labels, 2, sel);
 }
 
 // Settings menu (device/global). Four items; `sel` highlighted. Shows fw at the bottom.
@@ -334,10 +334,11 @@ inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("ASSIGN KNOB", CX, 32);
 
-    int items = paramCount + 2;   // + Tuner + Rigs/Setlists
+    int items = paramCount + 3;   // + Tuner + Setlist + Rig
     auto label = [&](int i) -> const char* {
         if (i < paramCount) return catalog[i].label;
-        return (i == paramCount) ? "Tuner" : "Rigs/Setlists";
+        if (i == paramCount) return "Tuner";
+        return (i == paramCount + 1) ? "Setlist" : "Rig";
     };
     auto orderOf = [&](int i) -> int { for (int k = 0; k < selLen; ++k) if (sel[k] == i) return k + 1; return 0; };
     auto fill = [&](int i, char* buf) {
@@ -355,9 +356,45 @@ inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.drawString(cb, CX, CY);
+    gfx.pushSprite(0, 0);
+}
+
+// Scroll-list value (Setlist / Rig knob): the current item big in the middle,
+// neighbors dimmed above/below, position at the bottom. Status + group dots.
+// No back row, no instructions.
+inline void drawScrollList(LGFX_Sprite& gfx, const char* title, const char names[][40], int count, int sel, uint16_t statusDot, int sigLevel, int groupLen = 1, int groupFocus = 0) {
+    gfx.fillScreen(COLOR_BG);
+    drawStatusIndicators(gfx, statusDot, sigLevel);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString(title, CX, CY - 56);
+    if (count <= 0) { gfx.pushSprite(0, 0); return; }
+
+    if (count > 1) {
+        int prev = (sel - 1 + count) % count, next = (sel + 1) % count;
+        gfx.setFont(&fonts::FreeSansBold9pt7b);
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.drawString(names[prev], CX, CY - 26);
+        gfx.drawString(names[next], CX, CY + 26);
+    }
+    const char* cur = names[sel];
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(cur) > 9 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(cur, CX, CY);
+
     gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.drawString("click=toggle  hold=done", CX, 206);
+    char pos[16]; snprintf(pos, sizeof(pos), "%d / %d", sel + 1, count);
+    gfx.drawString(pos, CX, CY + 52);
+
+    if (groupLen > 1) {
+        int n = groupLen > 8 ? 8 : groupLen;
+        constexpr int gap = 12;
+        int x0 = CX - (n - 1) * gap / 2;
+        for (int i = 0; i < n; ++i)
+            gfx.fillCircle(x0 + i * gap, CY + 72, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
+    }
     gfx.pushSprite(0, 0);
 }
 
