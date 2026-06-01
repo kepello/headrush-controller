@@ -180,6 +180,28 @@ inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char* backLab
     gfx.pushSprite(0, 0);
 }
 
+// Library idle screen: the default "dial-like" view that just shows the rig
+// currently loaded on the Prime (big), the setlist (small), and the usual
+// status indicators. The user enters the browser by turning the encoder.
+inline void drawLibraryIdle(LGFX_Sprite& gfx, const char* rigName, const char* setlistName, uint16_t statusDot, int sigLevel) {
+    gfx.fillScreen(COLOR_BG);
+    drawStatusIndicators(gfx, statusDot, sigLevel);
+    gfx.setTextDatum(middle_center);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString("LIBRARY", CX, 36);
+    const char* rn = (rigName && rigName[0]) ? rigName : "(no rig)";
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(rn) > 10 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(rn, CX, CY - 6);
+    if (setlistName && setlistName[0]) {
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.setFont(&fonts::FreeSansBold9pt7b);
+        gfx.drawString(setlistName, CX, CY + 32);
+    }
+    gfx.pushSprite(0, 0);
+}
+
 // Simple centered status (e.g. "loading...") for the list browser while the net
 // task fetches/loads over HTTP. UI task only.
 inline void drawListLoading(LGFX_Sprite& gfx, const char* msg) {

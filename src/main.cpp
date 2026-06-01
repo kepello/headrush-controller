@@ -141,14 +141,22 @@ char libSelRigId[40] = "";
 volatile bool libFetchSetlistsReq = false;  // UI -> net: load the setlist list
 volatile bool libFetchRigsReq = false;      // UI -> net: getSetlist(libSelSetlistId)
 volatile bool libLoadRigReq = false;        // UI -> net: loadRig(libSelRigId, libSelSetlistId)
+volatile bool libFetchCurrentReq = false;   // UI -> net: read the current rig name for the idle display
 volatile bool libReqDone = false;           // net -> UI: last request finished
 volatile bool libReqOk = false;             // net -> UI: it succeeded
+// Currently-loaded rig / setlist (Prime's view); shown on the library idle display.
+// Net writes (HTTP fetch on entry / WS push when the Prime swaps a rig); UI reads.
+char libCurrentRigName[40] = "";
+char libCurrentSetlistName[40] = "";
+char lastLibIdleRig[40] = "?";              // UI render cache (forces first draw)
+char lastLibIdleSetlist[40] = "?";
 
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
 constexpr uint32_t ECHO_SUPPRESS_MS = 500;
 constexpr uint32_t LONG_PRESS_MS = 3000;     // hold to enter config / go back
 constexpr uint32_t CONFIG_TIMEOUT_MS = 45000; // config returns to the dial after this idle
+constexpr uint32_t LIB_IDLE_TIMEOUT_MS = 10000; // library list returns to its idle view after this idle
 
 // ---- Shared state ----
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -231,9 +239,11 @@ volatile int deviceId = 1;
 int paramIndex = 0;
 
 // Library navigator (UI-task-local). Setlist list, then a setlist's rigs.
-enum LibState { LIB_SETLISTS, LIB_RIGS };
+// LIB_IDLE is the default — just shows the currently-loaded rig, like a dial.
+// Any encoder input enters LIB_SETLISTS; after a spell with no input we return.
+enum LibState { LIB_IDLE, LIB_SETLISTS, LIB_RIGS };
 bool libActive = false;       // current view is the library browser
-LibState libState = LIB_SETLISTS;
+LibState libState = LIB_IDLE;
 int  libSel = 0;              // cursor; 0 = "< Back", 1..count = entries
 bool libLoading = false;      // waiting on a net fetch/load
 bool libPendingLoad = false;  // the pending request is a loadRig (don't reset cursor on done)
@@ -252,10 +262,13 @@ void applyView(int slot) {
         tunerActive = true;
     } else if (viewIsLibrary(v)) {
         libActive = true;
-        libState = LIB_SETLISTS;
+        libState = LIB_IDLE;
         libSel = 0;
-        libReqDone = false; libLoading = true; libPendingLoad = false; libDirty = true;
-        libFetchSetlistsReq = true;
+        libReqDone = false; libLoading = false; libPendingLoad = false; libDirty = true;
+        lastLibIdleRig[0] = '?'; lastLibIdleRig[1] = 0;
+        lastLibIdleSetlist[0] = '?'; lastLibIdleSetlist[1] = 0;
+        libFetchSetlistsReq = true;   // pre-warm the list so the first turn is responsive
+        libFetchCurrentReq = true;    // populate the idle display
     } else {
         paramIndex = v;
         activeBinding = &PARAM_CATALOG[v];
@@ -363,6 +376,20 @@ String resolveHost(const WifiCreds& c) {
 
 // Net-task helpers. Called only from net task.
 void onValueChanged(const String& path, const String& prop, const JsonVariantConst& value) {
+    // Track the currently-loaded rig + setlist names so the library idle display
+    // reflects external changes (footswitch, other controller) without polling.
+    if (path == "/Evil/Engine/Patch/Rig" && prop == "PresetName" && value.is<const char*>()) {
+        const char* nm = value.as<const char*>();
+        portENTER_CRITICAL(&stateMux);
+        strncpy(libCurrentRigName, nm ? nm : "", 39); libCurrentRigName[39] = 0;
+        portEXIT_CRITICAL(&stateMux);
+    } else if (path == LIB_SETLISTS_PATH && prop == "loadedName" && value.is<const char*>()) {
+        const char* nm = value.as<const char*>();
+        portENTER_CRITICAL(&stateMux);
+        strncpy(libCurrentSetlistName, nm ? nm : "", 39); libCurrentSetlistName[39] = 0;
+        portEXIT_CRITICAL(&stateMux);
+    }
+    // Param echo for the active dial.
     if (path != activeBinding->path || prop != activeBinding->prop) return;
     portENTER_CRITICAL(&stateMux);
     uint32_t since = millis() - lastLocalChangeMs;
@@ -437,8 +464,25 @@ void doLibFetchSetlists() {
         }
         libSetlistCount = n;
         libReqOk = (n > 0);
+        const char* loaded = doc["loadedName"] | "";
+        portENTER_CRITICAL(&stateMux);
+        strncpy(libCurrentSetlistName, loaded, 39); libCurrentSetlistName[39] = 0;
+        portEXIT_CRITICAL(&stateMux);
     }
     libReqDone = true;
+}
+
+// Read the currently-loaded rig's name for the library idle display.
+void doLibFetchCurrent() {
+    JsonDocument doc;
+    if (hr.getProperties("/Evil/Engine/Patch/Rig", doc)) {
+        const char* nm = doc["PresetName"] | "";
+        portENTER_CRITICAL(&stateMux);
+        strncpy(libCurrentRigName, nm, 39); libCurrentRigName[39] = 0;
+        portEXIT_CRITICAL(&stateMux);
+    }
+    libReqDone = true;
+    libReqOk = true;
 }
 
 void doLibFetchRigs() {
@@ -736,6 +780,7 @@ void netTask(void*) {
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
             if (libFetchRigsReq)     { libFetchRigsReq = false; doLibFetchRigs(); }
             if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
+            if (libFetchCurrentReq)  { libFetchCurrentReq = false; doLibFetchCurrent(); }
             hr.loop();
             serviceTuner();
             if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; wifiRssi = 0; }
@@ -1071,32 +1116,66 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
-    // --- Library view --- (Setlist -> Rig browser; click selects, not cycles)
+    // --- Library view --- (idle = current rig; turn or click opens the browser)
     if (libActive) {
-        if (libLoading) {
-            if (libReqDone) {
-                libReqDone = false;
-                libLoading = false;
-                if (!libPendingLoad) libSel = 0;   // land on "< Back" after a fresh list
-                libPendingLoad = false;
-                libDirty = true;
-            } else {
-                if (libDirty) { Render::drawListLoading(canvas, "loading..."); libDirty = false; }
-                vTaskDelay(pdMS_TO_TICKS(20));
+        // Inactivity in a list returns to the idle display (the "current value").
+        if (libState != LIB_IDLE && !libLoading && (millis() - lastActivityMs) > LIB_IDLE_TIMEOUT_MS) {
+            libState = LIB_IDLE; libDirty = true;
+        }
+        // Consume any completed background fetch / load.
+        if (libReqDone) {
+            libReqDone = false;
+            bool wasLoad = libPendingLoad; libPendingLoad = false;
+            libLoading = false;
+            if (wasLoad) { libState = LIB_IDLE; libSel = 0; libFetchCurrentReq = true; }
+            else if (libState == LIB_SETLISTS || libState == LIB_RIGS) libSel = 0;
+            libDirty = true;
+        }
+        if (libState == LIB_IDLE) {
+            // Render idle: current rig + setlist. Redraw on dirty or any change.
+            char rig[40], slist[40];
+            portENTER_CRITICAL(&stateMux);
+            strncpy(rig, libCurrentRigName, 40); rig[39] = 0;
+            strncpy(slist, libCurrentSetlistName, 40); slist[39] = 0;
+            portEXIT_CRITICAL(&stateMux);
+            uint16_t sc = statusColor(connStatus);
+            int sl = signalLevel(wifiRssi);
+            bool nameChanged = strcmp(rig, lastLibIdleRig) != 0 || strcmp(slist, lastLibIdleSetlist) != 0;
+            if (nameChanged) noteActivity();   // an external rig change should wake the screen
+            if (libDirty || nameChanged || sc != lastStatusColor || sl != lastSignalLevel) {
+                Render::drawLibraryIdle(canvas, rig, slist, sc, sl);
+                strncpy(lastLibIdleRig, rig, 40); lastLibIdleRig[39] = 0;
+                strncpy(lastLibIdleSetlist, slist, 40); lastLibIdleSetlist[39] = 0;
+                lastStatusColor = sc; lastSignalLevel = sl;
+                libDirty = false;
+            }
+            if (edelta != 0) {                 // turning opens the browser
+                libState = LIB_SETLISTS; libSel = 0; libDirty = true;
+                if (libSetlistCount == 0) libLoading = true;  // fetch still in flight from entry
+                vTaskDelay(pdMS_TO_TICKS(10));
                 return;
             }
+            if (!clicked) { vTaskDelay(pdMS_TO_TICKS(10)); return; }
+            // click in IDLE falls through to the ring-cycle below (universal click=next view)
+        } else {
+        // LIB_SETLISTS / LIB_RIGS
+        if (libLoading) {
+            if (libDirty) { Render::drawListLoading(canvas, "loading..."); libDirty = false; }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            return;
         }
         int count = (libState == LIB_SETLISTS) ? libSetlistCount : libRigCount;
-        int total = count + 1;   // +1 for the "< Back" row at index 0
+        int total = count + 1;   // +1 for the back row at index 0
         if (edelta != 0) { libSel = (((libSel + edelta) % total) + total) % total; libDirty = true; }
         if (clicked) {
             if (libSel == 0) {                       // back row
                 if (libState == LIB_RIGS) {          // rigs -> setlists
                     libState = LIB_SETLISTS; libSel = 0; libDirty = true;
-                } else {                             // setlists -> exit to the next ring view
-                    ringSlot = (ringSlot + 1) % ringSize();
-                    applyView(ringSlot);
-                    lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+                } else {                             // setlists -> exit to idle
+                    // Return now: the draw block below only handles SETLISTS/RIGS,
+                    // so falling through would consume libDirty without drawing and
+                    // leave the stale list on screen. Let the IDLE branch redraw.
+                    libState = LIB_IDLE; libSel = 0; libDirty = true;
                     vTaskDelay(pdMS_TO_TICKS(10));
                     return;
                 }
@@ -1109,8 +1188,13 @@ void loop() {
                 libFetchRigsReq = true;
                 vTaskDelay(pdMS_TO_TICKS(10));
                 return;
-            } else {                                  // load the chosen rig
-                strncpy(libSelRigId, libRigIds[libSel - 1], sizeof(libSelRigId)); libSelRigId[39] = 0;
+            } else {                                  // load the chosen rig -> back to idle
+                int idx = libSel - 1;
+                strncpy(libSelRigId, libRigIds[idx], sizeof(libSelRigId)); libSelRigId[39] = 0;
+                // Optimistically reflect the new rig name so idle updates immediately.
+                portENTER_CRITICAL(&stateMux);
+                strncpy(libCurrentRigName, libRigNames[idx], 39); libCurrentRigName[39] = 0;
+                portEXIT_CRITICAL(&stateMux);
                 libReqDone = false; libLoading = true; libPendingLoad = true; libDirty = true;
                 libLoadRigReq = true;
                 vTaskDelay(pdMS_TO_TICKS(10));
@@ -1119,14 +1203,15 @@ void loop() {
         }
         if (libDirty) {
             if (libState == LIB_SETLISTS)
-                Render::drawListNav(canvas, "SETLISTS", "< Exit", libSetlistNames, libSetlistCount, libSel);
-            else
+                Render::drawListNav(canvas, "SETLISTS", "< Back", libSetlistNames, libSetlistCount, libSel);
+            else if (libState == LIB_RIGS)
                 Render::drawListNav(canvas, libSelSetlistName, "< Setlists", libRigNames, libRigCount, libSel);
             libDirty = false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
-    }
+        }  // end LIB_SETLISTS/LIB_RIGS else
+    }      // end libActive (IDLE+click falls through to ring-cycle below)
 
     if (clicked && ringSize() > 1) {  // short click cycles to the next view in the ring
         ringSlot = (ringSlot + 1) % ringSize();
