@@ -104,7 +104,7 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
         constexpr int gap = 12;
         int x0 = CX - (n - 1) * gap / 2;
         for (int i = 0; i < n; ++i)
-            gfx.fillCircle(x0 + i * gap, CY + 66, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_DIM);
+            gfx.fillCircle(x0 + i * gap, CY + 66, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
     }
     gfx.pushSprite(0, 0);
 }
