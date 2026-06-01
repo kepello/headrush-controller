@@ -43,7 +43,7 @@ inline float frac(const ContinuousBinding& cb, float v) {
 // open bottom of the arc (the 120° gap below the value) where there's more room
 // than crowding the top. Shared by the dial and the tuner.
 inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusDot, int sigLevel) {
-    constexpr int yBase = CY + 86;
+    constexpr int yBase = CY + 100;
     gfx.fillCircle(CX - 24, yBase - 6, 6, statusDot);
     for (int b = 0; b < 4; ++b) {
         int bh = 4 + b * 3;                       // bar heights 4,7,10,13
