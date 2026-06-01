@@ -194,7 +194,7 @@ inline void drawListNav(LGFX_Sprite& gfx, const char* title, const char* backLab
 // Library idle screen: the default "dial-like" view that just shows the rig
 // currently loaded on the Prime (big), the setlist (small), and the usual
 // status indicators. The user enters the browser by turning the encoder.
-inline void drawLibraryIdle(LGFX_Sprite& gfx, const char* rigName, const char* setlistName, uint16_t statusDot, int sigLevel) {
+inline void drawLibraryIdle(LGFX_Sprite& gfx, const char* rigName, const char* setlistName, uint16_t statusDot, int sigLevel, int groupLen = 1, int groupFocus = 0) {
     gfx.fillScreen(COLOR_BG);
     drawStatusIndicators(gfx, statusDot, sigLevel);
     gfx.setTextDatum(middle_center);
@@ -209,6 +209,16 @@ inline void drawLibraryIdle(LGFX_Sprite& gfx, const char* rigName, const char* s
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
         gfx.setFont(&fonts::FreeSansBold9pt7b);
         gfx.drawString(setlistName, CX, CY + 32);
+    }
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.drawString("double-click to browse", CX, CY + 56);
+    if (groupLen > 1) {
+        int n = groupLen > 8 ? 8 : groupLen;
+        constexpr int gap = 12;
+        int x0 = CX - (n - 1) * gap / 2;
+        for (int i = 0; i < n; ++i)
+            gfx.fillCircle(x0 + i * gap, CY + 74, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
     }
     gfx.pushSprite(0, 0);
 }
@@ -300,8 +310,8 @@ inline void drawSimpleMenu(LGFX_Sprite& gfx, const char* title, const char* cons
 
 // Board Menu (hold from Home): the top-level destinations.
 inline void drawBoardMenu(LGFX_Sprite& gfx, int sel) {
-    static const char* const labels[3] = { "Assign knob", "Rigs / Setlists", "Settings" };
-    drawSimpleMenu(gfx, "MENU", labels, 3, sel, "hold = back");
+    static const char* const labels[2] = { "Assign knob", "Settings" };
+    drawSimpleMenu(gfx, "MENU", labels, 2, sel, "hold = back");
 }
 
 // Settings menu (device/global). Four items; `sel` highlighted. Shows fw at the bottom.
@@ -324,8 +334,11 @@ inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.drawString("ASSIGN KNOB", CX, 32);
 
-    int items = paramCount + 1;   // + Tuner
-    auto label = [&](int i) -> const char* { return (i < paramCount) ? catalog[i].label : "Tuner"; };
+    int items = paramCount + 2;   // + Tuner + Rigs/Setlists
+    auto label = [&](int i) -> const char* {
+        if (i < paramCount) return catalog[i].label;
+        return (i == paramCount) ? "Tuner" : "Rigs/Setlists";
+    };
     auto orderOf = [&](int i) -> int { for (int k = 0; k < selLen; ++k) if (sel[k] == i) return k + 1; return 0; };
     auto fill = [&](int i, char* buf) {
         int o = orderOf(i);

@@ -234,6 +234,7 @@ int paramIndex = 0;   // catalog index of the currently focused Home member
 int  homeGroup[VIEW_COUNT] = { 0 };
 int  homeGroupLen = 1;
 int  homeFocus = 0;
+volatile bool homeLibraryIdle = false;   // focused Home member is Rigs/Setlists (net task reads it)
 
 // Library navigator (UI-task-local). Setlist list, then a setlist's rigs.
 // LIB_IDLE is the default — just shows the currently-loaded rig, like a dial.
@@ -253,8 +254,15 @@ bool libDirty = false;        // a redraw is needed
 void bindControl(int v) {
     tunerActive = false;
     libActive = false;
+    homeLibraryIdle = false;
     if (viewIsTuner(v)) {
         tunerActive = true;
+    } else if (viewIsLibrary(v)) {
+        homeLibraryIdle = true;            // Home shows the rig/setlist readout
+        lastLibIdleRig[0] = '?'; lastLibIdleRig[1] = 0;
+        lastLibIdleSetlist[0] = '?'; lastLibIdleSetlist[1] = 0;
+        libFetchCurrentReq = true;         // populate the readout
+        libFetchSetlistsReq = true;        // pre-warm so opening the browser is instant
     } else {
         if (v < 0 || v >= PARAM_COUNT) v = 0;
         paramIndex = v;
@@ -799,7 +807,7 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-            if (rebindRequested) { rebindRequested = false; if (!tunerActive && !libActive) primeInitialValue(); }  // new view picked
+            if (rebindRequested) { rebindRequested = false; if (!tunerActive && !libActive && !homeLibraryIdle) primeInitialValue(); }  // new view picked
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
             if (libFetchRigsReq)     { libFetchRigsReq = false; doLibFetchRigs(); }
             if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
@@ -869,7 +877,7 @@ void setup() {
     int n = 0;
     for (int i = 0; i < homeGroupLen && i < VIEW_COUNT; ++i) {
         int v = homeGroup[i];
-        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW) homeGroup[n++] = v;
+        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW || v == LIBRARY_VIEW) homeGroup[n++] = v;
     }
     homeGroupLen = (n > 0) ? n : 1;
     if (n == 0) homeGroup[0] = 0;
@@ -991,9 +999,6 @@ void loop() {
                 assignCursor = 0;
                 screen = SC_ASSIGN;
                 Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
-            } else if (boardSel == 1) {     // Rigs / Setlists
-                enterLibrary();
-                screen = SC_RIGS;
             } else {                        // Settings
                 menuIndex = 0;
                 screen = SC_SETTINGS;
@@ -1003,7 +1008,7 @@ void loop() {
             return;
         }
         if (edelta != 0) {
-            boardSel = (int)(((boardSel + edelta) % 3 + 3) % 3);
+            boardSel = (int)(((boardSel + edelta) % 2 + 2) % 2);
             Render::drawBoardMenu(canvas, boardSel);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -1012,8 +1017,9 @@ void loop() {
 
     // --- Assign this knob (multi-select -> ordered Home group) ---
     if (screen == SC_ASSIGN) {
-        const int items = PARAM_COUNT + 1;   // dials + Tuner (last)
-        int cursorView = (assignCursor < PARAM_COUNT) ? assignCursor : TUNER_VIEW;
+        const int items = PARAM_COUNT + 2;   // dials, then Tuner, then Rigs/Setlists
+        int cursorView = (assignCursor < PARAM_COUNT) ? assignCursor
+                        : (assignCursor == PARAM_COUNT) ? TUNER_VIEW : LIBRARY_VIEW;
         if (longPress) {                      // confirm the group, back to Home
             if (assignSelLen > 0) {
                 homeGroupLen = assignSelLen;
@@ -1215,12 +1221,12 @@ void loop() {
         }
         int count = (libState == LIB_SETLISTS) ? libSetlistCount : libRigCount;
         int total = count + 1;   // +1 for the back row at index 0
-        // hold = back one level (rigs -> setlists; setlists -> Board Menu)
+        // hold = back one level (rigs -> setlists; setlists -> Home readout)
         if (longPress) {
             if (libState == LIB_RIGS) { libState = LIB_SETLISTS; libSel = 0; libDirty = true; }
             else {
-                libActive = false; screen = SC_BOARD_MENU;
-                Render::drawBoardMenu(canvas, boardSel);
+                libActive = false; screen = SC_HOME; focusHomeMember(homeFocus);
+                lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
                 vTaskDelay(pdMS_TO_TICKS(5));
                 return;
             }
@@ -1230,9 +1236,9 @@ void loop() {
             if (libSel == 0) {                       // back row
                 if (libState == LIB_RIGS) {          // rigs -> setlists
                     libState = LIB_SETLISTS; libSel = 0; libDirty = true;
-                } else {                             // setlists -> Board Menu
-                    libActive = false; screen = SC_BOARD_MENU;
-                    Render::drawBoardMenu(canvas, boardSel);
+                } else {                             // setlists -> Home readout
+                    libActive = false; screen = SC_HOME; focusHomeMember(homeFocus);
+                    lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
                     vTaskDelay(pdMS_TO_TICKS(5));
                     return;
                 }
@@ -1283,10 +1289,39 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(5));
         return;
     }
-    // double-click toggles the focused control's effect-block bypass. Phase 2
-    // wires the actual Prime call; for now we flag it for the net task to log.
-    if (doubleClick && !tunerActive) {
-        bypassToggleReq = true;
+    // double-click = the focused member's action: open the browser for a
+    // Rigs/Setlists knob, else toggle the focused effect block's bypass (Phase 2
+    // wires the real Prime call; for now flag it for the net task to log).
+    if (doubleClick) {
+        if (homeLibraryIdle) {
+            enterLibrary(); screen = SC_RIGS;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        } else if (!tunerActive) {
+            bypassToggleReq = true;
+        }
+    }
+
+    // --- Rigs/Setlists Home readout --- (double-click opens the browser)
+    if (homeLibraryIdle) {
+        char rig[40], slist[40];
+        portENTER_CRITICAL(&stateMux);
+        strncpy(rig, libCurrentRigName, 40); rig[39] = 0;
+        strncpy(slist, libCurrentSetlistName, 40); slist[39] = 0;
+        portEXIT_CRITICAL(&stateMux);
+        uint16_t sc = statusColor(connStatus);
+        int sl = signalLevel(wifiRssi);
+        bool nameChanged = strcmp(rig, lastLibIdleRig) != 0 || strcmp(slist, lastLibIdleSetlist) != 0;
+        if (nameChanged) noteActivity();   // an external rig change wakes the screen
+        if (nameChanged || sc != lastStatusColor || sl != lastSignalLevel || lastRenderedValue == -999999.0f) {
+            Render::drawLibraryIdle(canvas, rig, slist, sc, sl, homeGroupLen, homeFocus);
+            strncpy(lastLibIdleRig, rig, 40); lastLibIdleRig[39] = 0;
+            strncpy(lastLibIdleSetlist, slist, 40); lastLibIdleSetlist[39] = 0;
+            lastStatusColor = sc; lastSignalLevel = sl;
+            lastRenderedValue = 0;   // mark drawn (clear the force-redraw sentinel)
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
     }
 
     // --- Tuner Home --- (no encoder writes; the net task drives the readout)

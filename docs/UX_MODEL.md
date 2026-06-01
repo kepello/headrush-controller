@@ -28,7 +28,7 @@ Prime's own 3 macro encoders require crouching).
 |---|---|
 | **Turn** | *Move*: change the focused value, or move the list cursor. Value edits are live (written to the Prime immediately). |
 | **Click** (short) | *Advance focus*: in a list, enter/select the highlighted item; on Home, cycle to the next control in the knob's group. |
-| **Double-click** | *Bypass*: toggle the focused control's effect-block enable/bypass. Home only; no-op for globals/EQ/tuner that have no block. |
+| **Double-click** | *The focused member's action* (Home only): for an effect control, toggle its block's bypass; for a Rigs/Setlists control, open the browser. No-op for globals/EQ/tuner that have neither. |
 | **Hold** (~1 s) | *Back*: up one level. At a board's Home screen, "up" opens the Board Menu. |
 
 Each gesture has exactly one meaning — no precedence rules. Turn never changes
@@ -49,20 +49,22 @@ A group of one is just a single control (single-click is then a no-op).
 ## 4. Screen hierarchy (identical on all 4 boards)
 
 ```
-HOME  ─ this board's assigned control for the loaded rig
-│       (a live value knob, OR Tuner, OR a readout)
-│       turn = adjust value · hold = up to Board Menu
+HOME  ─ this board's assigned control/group for the loaded rig
+│       a value dial, OR Tuner, OR a Rigs/Setlists readout
+│       turn = adjust · single-click = next member · double-click = member action · hold = Board Menu
 │
 └─ BOARD MENU            (hold from Home)
    ├─ Assign this knob → …   multi-select from controls AVAILABLE IN THE LOADED RIG
-   │                          (pick one, or several to form an ordered group)
-   ├─ Rigs / Setlists →      browse & load by name (replaces today's Library view)
-   ├─ Tempo                  precise BPM
-   ├─ Tuner
+   │                          (dials, Tuner, Rigs/Setlists — pick one or form an ordered group)
    └─ Settings →             device/global: ID, WiFi, firmware, mic strip, rename/save…
 ```
 
-All sub-screens obey the same grammar: turn=move, click=enter/toggle, hold=back.
+**Control types are assignable, not menu destinations.** Tuner and Rigs/Setlists
+aren't fixed menu items — they're control *types* in the Assign list, so a knob
+can BE the tuner or the rig browser (and can sit in a group with dials). A
+Rigs/Setlists knob shows a current rig/setlist readout at Home; **double-click
+opens the browser** (then turn=move, click=select/load, hold=back up a level →
+back to the readout). All sub-screens obey the same grammar.
 
 ## 5. Per-rig dynamic layout (the core idea)
 
