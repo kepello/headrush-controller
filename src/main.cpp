@@ -90,23 +90,14 @@ const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);
 // short click (cycle) or config swaps the pointer.
 const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 
-// View ring: a board cycles an ordered subset of views with a short click.
-// View indices 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; index PARAM_COUNT
-// is the Tuner view (live note/cents gauge); index PARAM_COUNT+1 is the Library
-// view (Setlist -> Rig browser). viewMask bit i selects view i for this board.
+// View indices: 0..PARAM_COUNT-1 are the PARAM_CATALOG dials; PARAM_COUNT is the
+// Tuner view. A board's Home carries an ordered group of these (see homeGroup).
+// LIBRARY_VIEW is a Board-Menu destination, not something assigned to the knob.
 const int TUNER_VIEW = PARAM_COUNT;
 const int LIBRARY_VIEW = PARAM_COUNT + 1;
 const int VIEW_COUNT = PARAM_COUNT + 2;
-uint32_t viewMask = 0;
-int ringSlot = 0;        // which enabled view is currently shown
 inline bool viewIsTuner(int v) { return v == TUNER_VIEW; }
 inline bool viewIsLibrary(int v) { return v == LIBRARY_VIEW; }
-int ringSize() { int n = 0; for (int i = 0; i < VIEW_COUNT; ++i) if (viewMask & (1u << i)) n++; return n; }
-int ringViewAt(int slot) {  // view index of the slot-th enabled view (-1 if none)
-    int seen = 0;
-    for (int i = 0; i < VIEW_COUNT; ++i) if (viewMask & (1u << i)) { if (seen == slot) return i; seen++; }
-    return -1;
-}
 
 // Tuner view shared state. The UI task sets tunerActive when the current ring
 // slot is the Tuner; the net task then mutes the Prime (user's choice) and polls
@@ -154,9 +145,8 @@ char lastLibIdleSetlist[40] = "?";
 constexpr int ENCODER_SIGN = -1;
 constexpr uint32_t WRITE_THROTTLE_MS = 30;
 constexpr uint32_t ECHO_SUPPRESS_MS = 500;
-constexpr uint32_t LONG_PRESS_MS = 3000;     // hold to enter config / go back
-constexpr uint32_t CONFIG_TIMEOUT_MS = 45000; // config returns to the dial after this idle
-constexpr uint32_t LIB_IDLE_TIMEOUT_MS = 10000; // library list returns to its idle view after this idle
+constexpr uint32_t LONG_PRESS_MS = 1000;      // hold = back / open Board Menu
+constexpr uint32_t DOUBLE_CLICK_MS = 250;     // window to detect a double-click (bypass)
 
 // ---- Shared state ----
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -174,6 +164,7 @@ volatile bool otaChecking = false;        // true while polling GitHub for a man
 char otaStatusMsg[40] = "checking...";    // shown on the checking screen (diagnostic)
 volatile bool otaCheckRequested = false;  // set by UI long-press, consumed by net task
 volatile bool rebindRequested = false;    // set when config picks a new param; net re-primes
+volatile bool bypassToggleReq = false;    // UI double-click on Home: toggle focused block bypass (Phase 2)
 
 HeadRushClient hr;
 Preferences prefs;
@@ -233,10 +224,16 @@ static int signalLevel(int rssi) {   // 0..4 bars
     return 0;
 }
 
-// Per-device identity (1..16) and chosen parameter (index into PARAM_CATALOG),
-// both set on-device in config mode and persisted in NVS.
+// Per-device identity (1..16), set on-device and persisted in NVS.
 volatile int deviceId = 1;
-int paramIndex = 0;
+int paramIndex = 0;   // catalog index of the currently focused Home member
+
+// Home assignment: an ordered group of controls the knob carries. Single-click
+// cycles the focused member; turn adjusts it. Members are view indices — a param
+// dial (0..PARAM_COUNT-1) or TUNER_VIEW. Persisted per board in NVS.
+int  homeGroup[VIEW_COUNT] = { 0 };
+int  homeGroupLen = 1;
+int  homeFocus = 0;
 
 // Library navigator (UI-task-local). Setlist list, then a setlist's rigs.
 // LIB_IDLE is the default — just shows the currently-loaded rig, like a dial.
@@ -249,40 +246,65 @@ bool libLoading = false;      // waiting on a net fetch/load
 bool libPendingLoad = false;  // the pending request is a loadRig (don't reset cursor on done)
 bool libDirty = false;        // a redraw is needed
 
-// Make the given ring slot the current view. Tuner raises tunerActive (the net
-// task reconciles muting/polling); Library raises libActive and kicks off a
-// setlist fetch; param views point activeBinding at the catalog entry. The net
-// task re-primes on rebindRequested. Called from the UI task only.
-void applyView(int slot) {
-    int v = ringViewAt(slot);
-    if (v < 0) v = 0;
+// Point the net task at a single control (a param dial or the tuner). Tuner
+// raises tunerActive (the net task reconciles muting/polling); a param view
+// points activeBinding at the catalog entry. rebindRequested makes the net task
+// re-prime the value. Called from the UI task only.
+void bindControl(int v) {
     tunerActive = false;
     libActive = false;
     if (viewIsTuner(v)) {
         tunerActive = true;
-    } else if (viewIsLibrary(v)) {
-        libActive = true;
-        libState = LIB_IDLE;
-        libSel = 0;
-        libReqDone = false; libLoading = false; libPendingLoad = false; libDirty = true;
-        lastLibIdleRig[0] = '?'; lastLibIdleRig[1] = 0;
-        lastLibIdleSetlist[0] = '?'; lastLibIdleSetlist[1] = 0;
-        libFetchSetlistsReq = true;   // pre-warm the list so the first turn is responsive
-        libFetchCurrentReq = true;    // populate the idle display
     } else {
+        if (v < 0 || v >= PARAM_COUNT) v = 0;
         paramIndex = v;
         activeBinding = &PARAM_CATALOG[v];
     }
     rebindRequested = true;
 }
 
-// Config mode is a UI-task-local modal state, entered by a long (~5s) press.
-enum ConfigState { CFG_NONE, CFG_MENU, CFG_EDIT_ID, CFG_EDIT_VIEWS,
-                   CFG_WIFI, CFG_WIFI_PW, CFG_WIFI_CONNECTING };
-ConfigState cfg = CFG_NONE;
-int menuIndex = 0;
+// Focus the i-th member of the Home group (wraps) and bind it.
+void focusHomeMember(int i) {
+    if (homeGroupLen < 1) homeGroupLen = 1;
+    homeFocus = ((i % homeGroupLen) + homeGroupLen) % homeGroupLen;
+    bindControl(homeGroup[homeFocus]);
+}
+
+// Enter the Rigs/Setlists browser (a Board-Menu destination). Starts at the
+// setlist list and kicks off the fetch. Called from the UI task only.
+void enterLibrary() {
+    tunerActive = false;
+    libActive = true;
+    libState = LIB_SETLISTS;
+    libSel = 0;
+    libReqDone = false; libPendingLoad = false; libDirty = true;
+    libLoading = (libSetlistCount == 0);
+    libFetchSetlistsReq = true;
+    libFetchCurrentReq = true;
+}
+
+// UI screen model. Every screen obeys the universal grammar: turn = move,
+// single-click = enter/next, double-click = bypass (Home only), hold = back.
+// Parent links are fixed (handled inline at each screen); the tree is shallow.
+enum Screen {
+    SC_HOME,            // the assigned knob: value group or tuner
+    SC_BOARD_MENU,      // hold from Home
+    SC_ASSIGN,          // multi-select the Home group
+    SC_RIGS,            // Rigs/Setlists browser (libActive)
+    SC_SETTINGS,        // device/global config menu
+    SC_SET_ID,
+    SC_WIFI, SC_WIFI_PW, SC_WIFI_CONNECTING
+};
+Screen screen = SC_HOME;
+int boardSel = 0;       // cursor in the Board Menu
+int menuIndex = 0;      // cursor in the Settings menu
 int editIdValue = 1;
-int viewSel = 0;   // cursor in the VIEWS multi-select (0..VIEW_COUNT = done)
+
+// Assign (multi-select) scratch: an ordered selection of view indices being
+// built into the Home group. assignCursor spans 0..PARAM_COUNT (==Tuner).
+int assignCursor = 0;
+int assignSel[VIEW_COUNT];
+int assignSelLen = 0;
 
 // On-device WiFi setup: the net task scans/connects, the UI picks + types.
 volatile bool scanRequested = false;  // UI -> net: run a scan
@@ -335,12 +357,13 @@ void saveDeviceId(int id) {
     Serial.printf("[nvs] devid<-%d (open=%d wrote=%u readback=%d)\n", id, ok, (unsigned)n, rb);
 }
 
-void saveViewMask(uint32_t mask) {
+void saveHomeGroup() {
     Preferences p;
     p.begin("hrctrl", false);
-    p.putUInt("views", mask);
+    p.putInt("hglen", homeGroupLen);
+    p.putBytes("hgrp", homeGroup, homeGroupLen * sizeof(int));
     p.end();
-    Serial.printf("[nvs] views<-0x%X\n", mask);
+    Serial.printf("[nvs] home group len=%d focus=%d\n", homeGroupLen, homeFocus);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -781,6 +804,10 @@ void netTask(void*) {
             if (libFetchRigsReq)     { libFetchRigsReq = false; doLibFetchRigs(); }
             if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
             if (libFetchCurrentReq)  { libFetchCurrentReq = false; doLibFetchCurrent(); }
+            if (bypassToggleReq) {   // Phase 1 stub — Phase 2 toggles the block's enable on the Prime
+                bypassToggleReq = false;
+                Serial.printf("[bypass] toggle requested for %s (stub — not yet wired)\n", activeBinding->label);
+            }
             hr.loop();
             serviceTuner();
             if (WiFi.status() != WL_CONNECTED) { online = false; connStatus = CS_WIFI_ERR; wifiRssi = 0; }
@@ -822,8 +849,15 @@ void setup() {
 
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 0);   // 0 = never provisioned
-    paramIndex = prefs.getInt("param", 0);
-    viewMask = prefs.getUInt("views", 0);
+    homeGroupLen = prefs.getInt("hglen", 0);
+    if (homeGroupLen >= 1 && homeGroupLen <= VIEW_COUNT) {
+        prefs.getBytes("hgrp", homeGroup, homeGroupLen * sizeof(int));
+    } else {
+        // Migrate an older single-param install (NVS key "param") to a 1-member group.
+        int p = prefs.getInt("param", 0);
+        if (p < 0 || p >= PARAM_COUNT) p = 0;
+        homeGroup[0] = p; homeGroupLen = 1;
+    }
     prefs.end();
 #ifdef PROVISION_ID
     // Fleet provisioning: bake this unit's ID at flash time, but only if it
@@ -831,13 +865,17 @@ void setup() {
     if (deviceId == 0) { deviceId = PROVISION_ID; saveDeviceId(deviceId); }
 #endif
     if (deviceId < 1 || deviceId > 16) deviceId = 1;
-    if (paramIndex < 0 || paramIndex >= PARAM_COUNT) paramIndex = 0;
-    if (viewMask == 0) viewMask = (1u << paramIndex);  // migrate old single param to a one-view ring
-    viewMask &= (1u << VIEW_COUNT) - 1;                 // drop any bits past the known views
-    if (ringSize() == 0) viewMask = (1u << 0);
-    ringSlot = 0;
-    applyView(ringSlot);
-    Serial.printf("Device ID: %d, views 0x%X, view %s\n", deviceId, viewMask,
+    // Validate group members against the known view set.
+    int n = 0;
+    for (int i = 0; i < homeGroupLen && i < VIEW_COUNT; ++i) {
+        int v = homeGroup[i];
+        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW) homeGroup[n++] = v;
+    }
+    homeGroupLen = (n > 0) ? n : 1;
+    if (n == 0) homeGroup[0] = 0;
+    homeFocus = 0;
+    focusHomeMember(0);
+    Serial.printf("Device ID: %d, home group len=%d, view %s\n", deviceId, homeGroupLen,
                   tunerActive ? "Tuner" : activeBinding->label);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
@@ -894,9 +932,10 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(20));
         return;
     }
-    if (uiMode != UI_GAUGE && cfg == CFG_NONE) { uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+    if (uiMode != UI_GAUGE) { uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
 
-    // --- Read input once: a short click, a ~5s long-press, and the turn delta ---
+    // --- Read input: a short tap (immediate, for menus), a 1s long-press
+    // (back), and the turn delta. ---
     bool clicked = false, longPress = false;
     {
         static uint32_t down = 0;
@@ -912,6 +951,23 @@ void loop() {
             down = 0;
         }
     }
+    // Resolve taps into single vs double click for the Home screen. A lone tap
+    // becomes a singleClick only after DOUBLE_CLICK_MS passes with no second tap;
+    // a second tap inside the window is a doubleClick. Menus use `clicked`
+    // directly, so they have no added latency.
+    bool singleClick = false, doubleClick = false;
+    {
+        static uint32_t pendingMs = 0;
+        static bool pending = false;
+        if (screen != SC_HOME) {
+            pending = false;   // only Home uses single/double; never carry a tap across screens
+        } else if (clicked) {
+            if (pending && (millis() - pendingMs) <= DOUBLE_CLICK_MS) { doubleClick = true; pending = false; }
+            else { pending = true; pendingMs = millis(); }
+        } else if (pending && (millis() - pendingMs) > DOUBLE_CLICK_MS) {
+            singleClick = true; pending = false;
+        }
+    }
     long edelta = 0;
     if (encoder.encoderChanged()) {
         long v = encoder.readEncoder();
@@ -919,41 +975,99 @@ void loop() {
         lastEncoderValue = v;
     }
     if (edelta != 0 || clicked || longPress) noteActivity();
+    // No inactivity auto-return: a board stays on whatever screen it was left on.
 
-    // Config times out back to the dial after inactivity, so a board left in a
-    // menu returns to normal operation on its own. (lastActivityMs only advances
-    // on input while in config — no value/tuner changes happen on these screens.)
-    if (cfg != CFG_NONE && (millis() - lastActivityMs) > CONFIG_TIMEOUT_MS) {
-        cfg = CFG_NONE;
-        uiMode = UI_GAUGE;
-        lastRenderedValue = -999999.0f;
-        lastTunerCents = -999.0f;
-        vTaskDelay(pdMS_TO_TICKS(5));
-        return;
-    }
-
-    // --- Config menu ---
-    if (cfg == CFG_MENU) {
-        if (longPress) { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
+    // --- Board Menu (hold from Home) ---
+    if (screen == SC_BOARD_MENU) {
+        if (longPress) {   // back to Home
+            screen = SC_HOME; focusHomeMember(homeFocus);
+            lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+            vTaskDelay(pdMS_TO_TICKS(5)); return;
+        }
         if (clicked) {
-            if (menuIndex == 0) { editIdValue = deviceId; cfg = CFG_EDIT_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
-            else if (menuIndex == 1) { viewSel = 0; cfg = CFG_EDIT_VIEWS; Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask); }
-            else if (menuIndex == 2) { cfg = CFG_WIFI; wifiPickIndex = 1; scanDone = false; scanRequested = true; }  // scan starts
-            else if (menuIndex == 3) { otaCheckRequested = true; cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
-            else { cfg = CFG_NONE; uiMode = UI_GAUGE; lastRenderedValue = -999999.0f; }
+            if (boardSel == 0) {            // Assign this knob — seed from current group
+                assignSelLen = homeGroupLen;
+                for (int i = 0; i < homeGroupLen; ++i) assignSel[i] = homeGroup[i];
+                assignCursor = 0;
+                screen = SC_ASSIGN;
+                Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+            } else if (boardSel == 1) {     // Rigs / Setlists
+                enterLibrary();
+                screen = SC_RIGS;
+            } else {                        // Settings
+                menuIndex = 0;
+                screen = SC_SETTINGS;
+                Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) {
-            menuIndex = (int)(((menuIndex + edelta) % 5 + 5) % 5);
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+            boardSel = (int)(((boardSel + edelta) % 3 + 3) % 3);
+            Render::drawBoardMenu(canvas, boardSel);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Assign this knob (multi-select -> ordered Home group) ---
+    if (screen == SC_ASSIGN) {
+        const int items = PARAM_COUNT + 1;   // dials + Tuner (last)
+        int cursorView = (assignCursor < PARAM_COUNT) ? assignCursor : TUNER_VIEW;
+        if (longPress) {                      // confirm the group, back to Home
+            if (assignSelLen > 0) {
+                homeGroupLen = assignSelLen;
+                for (int i = 0; i < assignSelLen; ++i) homeGroup[i] = assignSel[i];
+                saveHomeGroup();
+                focusHomeMember(0);
+            }
+            screen = SC_HOME;
+            lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (clicked) {                        // toggle the cursor control in/out of the group
+            int at = -1;
+            for (int i = 0; i < assignSelLen; ++i) if (assignSel[i] == cursorView) { at = i; break; }
+            if (at >= 0) {                    // remove (preserve order)
+                for (int i = at; i < assignSelLen - 1; ++i) assignSel[i] = assignSel[i + 1];
+                assignSelLen--;
+            } else if (assignSelLen < VIEW_COUNT) {
+                assignSel[assignSelLen++] = cursorView;   // append in selection order
+            }
+            Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            assignCursor = (int)(((assignCursor + edelta) % items + items) % items);
+            Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Settings menu ---
+    if (screen == SC_SETTINGS) {
+        if (longPress) { screen = SC_BOARD_MENU; Render::drawBoardMenu(canvas, boardSel); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (clicked) {
+            if (menuIndex == 0) { editIdValue = deviceId; screen = SC_SET_ID; Render::drawConfigIdEdit(canvas, editIdValue); }
+            else if (menuIndex == 1) { screen = SC_WIFI; wifiPickIndex = 1; scanDone = false; scanRequested = true; }  // scan starts
+            else if (menuIndex == 2) { otaCheckRequested = true; screen = SC_HOME; focusHomeMember(homeFocus); lastRenderedValue = -999999.0f; lastTunerCents = -999.0f; }
+            else { screen = SC_BOARD_MENU; Render::drawBoardMenu(canvas, boardSel); }   // Exit -> Board Menu
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            menuIndex = (int)(((menuIndex + edelta) % 4 + 4) % 4);
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
 
     // --- WiFi network picker (Stage 1b: scan + pick; password/connect = Stage 2) ---
-    if (cfg == CFG_WIFI) {
+    if (screen == SC_WIFI) {
         static bool shownScanning = false;
         static int  shownPick = -2;
         if (!scanDone) {  // scan in progress
@@ -962,7 +1076,7 @@ void loop() {
             return;
         }
         shownScanning = false;
-        if (longPress) { cfg = CFG_MENU; shownPick = -2; Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+        if (longPress) { screen = SC_SETTINGS; shownPick = -2; Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (scanCount <= 0) {  // no networks — click to rescan
             if (clicked) { scanDone = false; scanRequested = true; shownPick = -2; vTaskDelay(pdMS_TO_TICKS(5)); return; }
             if (shownPick != -1) { shownPick = -1; Render::drawWifiPicker(canvas, scanSSIDs, 0, 0); }
@@ -971,15 +1085,15 @@ void loop() {
         }
         if (clicked) {
             if (wifiPickIndex == 0) {  // "< Back" -> config menu
-                cfg = CFG_MENU; shownPick = -2;
-                Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+                screen = SC_SETTINGS; shownPick = -2;
+                Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
                 vTaskDelay(pdMS_TO_TICKS(5));
                 return;
             }
             strncpy(selectedSSID, scanSSIDs[wifiPickIndex - 1], sizeof(selectedSSID)); selectedSSID[32] = 0;
             Serial.printf("[wifi] picked %s\n", selectedSSID);
             wifiPassword[0] = 0; pwIndex = 3; shownPick = -2;
-            cfg = CFG_WIFI_PW;
+            screen = SC_WIFI_PW;
             char ib[2] = { PW_CHARS[0], 0 };
             Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -992,7 +1106,7 @@ void loop() {
     }
 
     // --- WiFi password entry (encoder picker: 0=OK, 1=DEL, 2+=chars) ---
-    if (cfg == CFG_WIFI_PW) {
+    if (screen == SC_WIFI_PW) {
         const int items = (int)strlen(PW_CHARS) + 3;
         char itemBuf[4];
         auto labelFor = [&](int idx) -> const char* {
@@ -1002,8 +1116,8 @@ void loop() {
             itemBuf[0] = PW_CHARS[idx - 3]; itemBuf[1] = 0; return itemBuf;
         };
         if (longPress) {  // cancel back to menu
-            cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+            screen = SC_SETTINGS;
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -1011,14 +1125,14 @@ void loop() {
             if (pwIndex == 0) {  // OK -> attempt connect (net task)
                 strncpy(wifiPassEntry, wifiPassword, sizeof(wifiPassEntry)); wifiPassEntry[63] = 0;
                 wifiConnectResult = 0; wifiConnectRequested = true;
-                cfg = CFG_WIFI_CONNECTING;
+                screen = SC_WIFI_CONNECTING;
                 Render::drawSplash(canvas, deviceId, FW_VERSION, "connecting");
             } else if (pwIndex == 1) {  // DEL
                 int L = strlen(wifiPassword); if (L) wifiPassword[L - 1] = 0;
                 Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
             } else if (pwIndex == 2) {  // Back -> config menu
-                cfg = CFG_MENU;
-                Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+                screen = SC_SETTINGS;
+                Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
             } else {  // append char
                 int L = strlen(wifiPassword); if (L < 63) { wifiPassword[L] = PW_CHARS[pwIndex - 3]; wifiPassword[L + 1] = 0; }
                 Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, labelFor(pwIndex));
@@ -1035,7 +1149,7 @@ void loop() {
     }
 
     // --- WiFi connecting (net task attempts the join) ---
-    if (cfg == CFG_WIFI_CONNECTING) {
+    if (screen == SC_WIFI_CONNECTING) {
         if (wifiConnectResult == 1) {  // success — net task reboots momentarily
             Render::drawSplash(canvas, deviceId, FW_VERSION, "connected!");
             vTaskDelay(pdMS_TO_TICKS(50));
@@ -1045,7 +1159,7 @@ void loop() {
             Render::drawSplash(canvas, deviceId, FW_VERSION, "connect failed");
             delay(2500);
             wifiConnectResult = 0; pwIndex = 3;
-            cfg = CFG_WIFI_PW;
+            screen = SC_WIFI_PW;
             char ib[2] = { PW_CHARS[0], 0 };
             Render::drawPasswordEntry(canvas, selectedSSID, wifiPassword, ib);
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -1056,15 +1170,15 @@ void loop() {
     }
 
     // --- Device-ID editor ---
-    if (cfg == CFG_EDIT_ID) {
-        if (longPress) { cfg = CFG_MENU; Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
+    if (screen == SC_SET_ID) {
+        if (longPress) { screen = SC_SETTINGS; Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION); vTaskDelay(pdMS_TO_TICKS(5)); return; }
         if (clicked) {
             if (editIdValue != deviceId) {
                 deviceId = editIdValue;     // identity only; applies immediately
                 saveDeviceId(deviceId);
             }
-            cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
+            screen = SC_SETTINGS;
+            Render::drawConfigMenu(canvas, menuIndex, deviceId, FW_VERSION);
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
@@ -1078,87 +1192,22 @@ void loop() {
         return;
     }
 
-    // --- Views multi-select ---
-    // Spinner over VIEW_COUNT params plus a trailing "done" slot (index ==
-    // VIEW_COUNT). Click on a param toggles whether this board's ring includes
-    // it; click on "done" (or long-press) commits the ring and returns to menu.
-    if (cfg == CFG_EDIT_VIEWS) {
-        auto commit = [&]() {
-            if (ringSize() == 0) viewMask = (1u << 0);   // never leave an empty ring
-            saveViewMask(viewMask);
-            if (ringSlot >= ringSize()) ringSlot = 0;
-            applyView(ringSlot);
-            cfg = CFG_MENU;
-            Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
-            vTaskDelay(pdMS_TO_TICKS(5));
-        };
-        if (longPress) { commit(); return; }
-        if (clicked) {
-            if (viewSel >= VIEW_COUNT) { commit(); return; }
-            viewMask ^= (1u << viewSel);
-            Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask);
-            return;
-        }
-        if (edelta != 0) {
-            int total = VIEW_COUNT + 1;
-            viewSel = (((viewSel + edelta) % total) + total) % total;
-            Render::drawViewSelect(canvas, PARAM_CATALOG, PARAM_COUNT, VIEW_COUNT, viewSel, viewMask);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-        return;
-    }
-
-    // --- Normal gauge mode ---
-    if (longPress) {  // enter config
-        cfg = CFG_MENU;
-        menuIndex = 0;
-        Render::drawConfigMenu(canvas, menuIndex, deviceId, ringSize(), FW_VERSION);
-        vTaskDelay(pdMS_TO_TICKS(10));
-        return;
-    }
-    // --- Library view --- (idle = current rig; turn or click opens the browser)
-    if (libActive) {
-        // Inactivity in a list returns to the idle display (the "current value").
-        if (libState != LIB_IDLE && !libLoading && (millis() - lastActivityMs) > LIB_IDLE_TIMEOUT_MS) {
-            libState = LIB_IDLE; libDirty = true;
-        }
+    // --- Rigs / Setlists browser (a Board-Menu destination) ---
+    if (screen == SC_RIGS) {
         // Consume any completed background fetch / load.
         if (libReqDone) {
             libReqDone = false;
             bool wasLoad = libPendingLoad; libPendingLoad = false;
             libLoading = false;
-            if (wasLoad) { libState = LIB_IDLE; libSel = 0; libFetchCurrentReq = true; }
-            else if (libState == LIB_SETLISTS || libState == LIB_RIGS) libSel = 0;
-            libDirty = true;
-        }
-        if (libState == LIB_IDLE) {
-            // Render idle: current rig + setlist. Redraw on dirty or any change.
-            char rig[40], slist[40];
-            portENTER_CRITICAL(&stateMux);
-            strncpy(rig, libCurrentRigName, 40); rig[39] = 0;
-            strncpy(slist, libCurrentSetlistName, 40); slist[39] = 0;
-            portEXIT_CRITICAL(&stateMux);
-            uint16_t sc = statusColor(connStatus);
-            int sl = signalLevel(wifiRssi);
-            bool nameChanged = strcmp(rig, lastLibIdleRig) != 0 || strcmp(slist, lastLibIdleSetlist) != 0;
-            if (nameChanged) noteActivity();   // an external rig change should wake the screen
-            if (libDirty || nameChanged || sc != lastStatusColor || sl != lastSignalLevel) {
-                Render::drawLibraryIdle(canvas, rig, slist, sc, sl);
-                strncpy(lastLibIdleRig, rig, 40); lastLibIdleRig[39] = 0;
-                strncpy(lastLibIdleSetlist, slist, 40); lastLibIdleSetlist[39] = 0;
-                lastStatusColor = sc; lastSignalLevel = sl;
-                libDirty = false;
-            }
-            if (edelta != 0) {                 // turning opens the browser
-                libState = LIB_SETLISTS; libSel = 0; libDirty = true;
-                if (libSetlistCount == 0) libLoading = true;  // fetch still in flight from entry
-                vTaskDelay(pdMS_TO_TICKS(10));
+            if (wasLoad) {                       // a rig was loaded — return to the knob
+                libActive = false;
+                screen = SC_HOME; focusHomeMember(homeFocus);
+                lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+                vTaskDelay(pdMS_TO_TICKS(5));
                 return;
             }
-            if (!clicked) { vTaskDelay(pdMS_TO_TICKS(10)); return; }
-            // click in IDLE falls through to the ring-cycle below (universal click=next view)
-        } else {
-        // LIB_SETLISTS / LIB_RIGS
+            libSel = 0; libDirty = true;
+        }
         if (libLoading) {
             if (libDirty) { Render::drawListLoading(canvas, "loading..."); libDirty = false; }
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -1166,17 +1215,25 @@ void loop() {
         }
         int count = (libState == LIB_SETLISTS) ? libSetlistCount : libRigCount;
         int total = count + 1;   // +1 for the back row at index 0
+        // hold = back one level (rigs -> setlists; setlists -> Board Menu)
+        if (longPress) {
+            if (libState == LIB_RIGS) { libState = LIB_SETLISTS; libSel = 0; libDirty = true; }
+            else {
+                libActive = false; screen = SC_BOARD_MENU;
+                Render::drawBoardMenu(canvas, boardSel);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                return;
+            }
+        }
         if (edelta != 0) { libSel = (((libSel + edelta) % total) + total) % total; libDirty = true; }
         if (clicked) {
             if (libSel == 0) {                       // back row
                 if (libState == LIB_RIGS) {          // rigs -> setlists
                     libState = LIB_SETLISTS; libSel = 0; libDirty = true;
-                } else {                             // setlists -> exit to idle
-                    // Return now: the draw block below only handles SETLISTS/RIGS,
-                    // so falling through would consume libDirty without drawing and
-                    // leave the stale list on screen. Let the IDLE branch redraw.
-                    libState = LIB_IDLE; libSel = 0; libDirty = true;
-                    vTaskDelay(pdMS_TO_TICKS(10));
+                } else {                             // setlists -> Board Menu
+                    libActive = false; screen = SC_BOARD_MENU;
+                    Render::drawBoardMenu(canvas, boardSel);
+                    vTaskDelay(pdMS_TO_TICKS(5));
                     return;
                 }
             } else if (libState == LIB_SETLISTS) {   // drill into a setlist's rigs
@@ -1188,10 +1245,9 @@ void loop() {
                 libFetchRigsReq = true;
                 vTaskDelay(pdMS_TO_TICKS(10));
                 return;
-            } else {                                  // load the chosen rig -> back to idle
+            } else {                                  // load the chosen rig
                 int idx = libSel - 1;
                 strncpy(libSelRigId, libRigIds[idx], sizeof(libSelRigId)); libSelRigId[39] = 0;
-                // Optimistically reflect the new rig name so idle updates immediately.
                 portENTER_CRITICAL(&stateMux);
                 strncpy(libCurrentRigName, libRigNames[idx], 39); libCurrentRigName[39] = 0;
                 portEXIT_CRITICAL(&stateMux);
@@ -1210,19 +1266,30 @@ void loop() {
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
-        }  // end LIB_SETLISTS/LIB_RIGS else
-    }      // end libActive (IDLE+click falls through to ring-cycle below)
+    }
 
-    if (clicked && ringSize() > 1) {  // short click cycles to the next view in the ring
-        ringSlot = (ringSlot + 1) % ringSize();
-        applyView(ringSlot);
-        lastRenderedValue = -999999.0f;  // force a redraw of the new view
-        lastTunerCents = -999.0f;
+    // ============================ HOME ============================
+    // hold opens the Board Menu.
+    if (longPress) {
+        boardSel = 0; screen = SC_BOARD_MENU;
+        Render::drawBoardMenu(canvas, boardSel);
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
+    // single-click steps to the next group member (no-op for a group of one).
+    if (singleClick && homeGroupLen > 1) {
+        focusHomeMember(homeFocus + 1);
+        lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
+        vTaskDelay(pdMS_TO_TICKS(5));
+        return;
+    }
+    // double-click toggles the focused control's effect-block bypass. Phase 2
+    // wires the actual Prime call; for now we flag it for the net task to log.
+    if (doubleClick && !tunerActive) {
+        bypassToggleReq = true;
+    }
 
-    // --- Tuner view --- (no encoder writes; the net task drives the readout)
+    // --- Tuner Home --- (no encoder writes; the net task drives the readout)
     if (tunerActive) {
         char note[8];
         float cents;
@@ -1268,7 +1335,7 @@ void loop() {
     bool valueChanged = fabsf(v - lastRenderedValue) >= activeBinding->step * 0.5f;
     if (valueChanged) noteActivity();  // a moving value (local or external) keeps the screen awake
     if (valueChanged || sc != lastStatusColor || sl != lastSignalLevel) {
-        Render::drawContinuous(canvas, *activeBinding, v, sc, sl);
+        Render::drawContinuous(canvas, *activeBinding, v, sc, sl, homeGroupLen, homeFocus);
         lastRenderedValue = v;
         lastStatusColor = sc;
         lastSignalLevel = sl;

@@ -55,7 +55,9 @@ inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusDot, int sigLe
 // Draw the full arc gauge for a continuous binding. Background arc + colored
 // foreground proportional to value. Center: big value text + small unit. Top:
 // short label. Call from the UI task only.
-inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot, int sigLevel) {
+// groupLen/groupFocus drive the knob-group dots: one dot per member with the
+// active member highlighted (omitted for a group of one).
+inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float value, uint16_t statusDot, int sigLevel, int groupLen = 1, int groupFocus = 0) {
     gfx.fillScreen(COLOR_BG);
 
     drawStatusIndicators(gfx, statusDot, sigLevel);
@@ -94,6 +96,15 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
         gfx.setFont(&fonts::FreeSansBold12pt7b);
         gfx.drawString(cb.unit, CX, CY + 44);
+    }
+
+    // Knob-group dots: one per member, active highlighted.
+    if (groupLen > 1) {
+        int n = groupLen > 8 ? 8 : groupLen;
+        constexpr int gap = 12;
+        int x0 = CX - (n - 1) * gap / 2;
+        for (int i = 0; i < n; ++i)
+            gfx.fillCircle(x0 + i * gap, CY + 66, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_DIM);
     }
     gfx.pushSprite(0, 0);
 }
@@ -262,33 +273,78 @@ inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char
     gfx.pushSprite(0, 0);
 }
 
-// Config-mode menu. Five items; `sel` is the highlighted index.
-inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, int ringCount, int fwVersion) {
+// Simple vertical menu: a title and a list of items, `sel` highlighted with a
+// leading ">". Shared by the Board Menu and Settings menu.
+inline void drawSimpleMenu(LGFX_Sprite& gfx, const char* title, const char* const* labels, int count, int sel, const char* footer = nullptr) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
-
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString("CONFIG", CX, 24);
-
-    char idbuf[20], pbuf[20];
-    snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
-    snprintf(pbuf, sizeof(pbuf), "Views: %d", ringCount);
-    const char* labels[5] = { idbuf, pbuf, "WiFi", "Update firmware", "Exit" };
-    for (int i = 0; i < 5; ++i) {
-        int y = 58 + i * 30;
+    gfx.drawString(title, CX, 28);
+    int y0 = 120 - ((count - 1) * 32) / 2;   // vertically centered block
+    for (int i = 0; i < count; ++i) {
+        int y = y0 + i * 32;
         bool s = (i == sel);
         gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
         gfx.setFont(&fonts::FreeSansBold12pt7b);
         gfx.drawString(labels[i], CX, y);
         if (s) gfx.drawString(">", CX - 104, y);
     }
+    if (footer) {
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.setFont(&fonts::FreeSansBold9pt7b);
+        gfx.drawString(footer, CX, 212);
+    }
+    gfx.pushSprite(0, 0);
+}
 
-    char fwbuf[16];
+// Board Menu (hold from Home): the top-level destinations.
+inline void drawBoardMenu(LGFX_Sprite& gfx, int sel) {
+    static const char* const labels[3] = { "Assign knob", "Rigs / Setlists", "Settings" };
+    drawSimpleMenu(gfx, "MENU", labels, 3, sel, "hold = back");
+}
+
+// Settings menu (device/global). Four items; `sel` highlighted. Shows fw at the bottom.
+inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, int fwVersion) {
+    char idbuf[20], fwbuf[16];
+    snprintf(idbuf, sizeof(idbuf), "Device ID: %d", deviceId);
     snprintf(fwbuf, sizeof(fwbuf), "fw %d", fwVersion);
+    const char* labels[4] = { idbuf, "WiFi", "Update firmware", "Exit" };
+    drawSimpleMenu(gfx, "SETTINGS", labels, 4, sel, fwbuf);
+}
+
+// Assign-this-knob multi-select: a spinner over the catalog (dials then Tuner).
+// Selected members show their 1-based position in the group; `cursor` is the
+// highlighted item. sel[] holds the chosen view indices (param idx, or
+// paramCount for Tuner) in order. Hold confirms; click toggles.
+inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, int paramCount, int cursor, const int* sel, int selLen) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.drawString("ASSIGN KNOB", CX, 32);
+
+    int items = paramCount + 1;   // + Tuner
+    auto label = [&](int i) -> const char* { return (i < paramCount) ? catalog[i].label : "Tuner"; };
+    auto orderOf = [&](int i) -> int { for (int k = 0; k < selLen; ++k) if (sel[k] == i) return k + 1; return 0; };
+    auto fill = [&](int i, char* buf) {
+        int o = orderOf(i);
+        if (o) snprintf(buf, 28, "[%d] %s", o, label(i));
+        else   snprintf(buf, 28, "[ ] %s", label(i));
+    };
+    int prev = (cursor - 1 + items) % items, next = (cursor + 1) % items;
+    char pb[28], cb[28], nb[28];
+    fill(prev, pb); fill(cursor, cb); fill(next, nb);
     gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.drawString(fwbuf, CX, 212);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString(pb, CX, CY - 40);
+    gfx.drawString(nb, CX, CY + 40);
+    gfx.setFont(&fonts::FreeSansBold12pt7b);
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.drawString(cb, CX, CY);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.drawString("click=toggle  hold=done", CX, 206);
     gfx.pushSprite(0, 0);
 }
 
