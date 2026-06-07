@@ -39,16 +39,40 @@ inline float frac(const ContinuousBinding& cb, float v) {
     return f;
 }
 
-// Connection-status dot (color set by caller) + WiFi signal bars, drawn in the
-// open bottom of the arc (the 120° gap below the value) where there's more room
-// than crowding the top. Shared by the dial and the tuner.
-inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusDot, int sigLevel) {
+// Connection status + WiFi signal in one widget: the signal bars themselves
+// carry the connection-status color (no separate dot). When the signal is
+// unknown (boot / WiFi error / disconnected, sigLevel 0) every bar lights in the
+// status color so the state still reads at a glance — e.g. four red bars = down.
+// Drawn centered in the open bottom of the arc. Shared by the dial and tuner.
+inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusColor, int sigLevel) {
     constexpr int yBase = CY + 100;
-    gfx.fillCircle(CX - 24, yBase - 6, 6, statusDot);
+    constexpr int x0 = CX - 12;                   // 4 bars*4px + 3 gaps*3px = 25px, centered on CX
     for (int b = 0; b < 4; ++b) {
         int bh = 4 + b * 3;                       // bar heights 4,7,10,13
-        gfx.fillRect(CX - 6 + b * 7, yBase - bh, 4, bh,
-                     b < sigLevel ? COLOR_VALUE : COLOR_DIM);
+        bool on = (sigLevel > 0) ? (b < sigLevel) : true;
+        gfx.fillRect(x0 + b * 7, yBase - bh, 4, bh, on ? statusColor : COLOR_DIM);
+    }
+}
+
+// Position-in-list indicator for any picker: dots spaced along the value-arc
+// band, centered at 12 o'clock with the active item highlighted. The arc of dots
+// grows with the count — a couple of dots sit right at the top; as the list grows
+// the spread widens up to the full gauge sweep (then packs tighter). Replaces a
+// value bar on list screens, which have no continuous value to show.
+inline void drawArcDots(LGFX_Sprite& gfx, int count, int sel) {
+    if (count <= 0) return;
+    constexpr float R = (ARC_INNER_R + ARC_OUTER_R) / 2.0f;   // 108, the bar band
+    constexpr float TOP_DEG = 270.0f;                         // 12 o'clock
+    constexpr float PER_DOT = 20.0f;                          // spacing before the arc is full
+    float span = (count > 1) ? fminf(ARC_SPAN_DEG, (count - 1) * PER_DOT) : 0.0f;
+    float start = TOP_DEG - span / 2.0f;
+    int r = count <= 12 ? 5 : (count <= 24 ? 4 : 3);
+    for (int i = 0; i < count; ++i) {
+        float a = (count > 1) ? (start + span * i / (count - 1)) : TOP_DEG;
+        float rad = a * 0.017453293f;
+        int x = CX + (int)lroundf(R * cosf(rad));
+        int y = CY + (int)lroundf(R * sinf(rad));
+        gfx.fillCircle(x, y, r, (i == sel) ? COLOR_VALUE : COLOR_LABEL);
     }
 }
 
@@ -313,6 +337,8 @@ inline void drawSimpleMenu(LGFX_Sprite& gfx, const char* title, const char* cons
         gfx.setFont(&fonts::FreeSansBold9pt7b);
         gfx.drawString(footer, CX, 212);
     }
+    // No arc dots here: the menu shows all items at once with a cursor, so the
+    // position is already visible (and the title sits where the top dots land).
     gfx.pushSprite(0, 0);
 }
 
@@ -364,6 +390,7 @@ inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, i
     gfx.setFont(&fonts::FreeSansBold12pt7b);
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);
     gfx.drawString(cb, CX, CY);
+    drawArcDots(gfx, items, cursor);
     gfx.pushSprite(0, 0);
 }
 
@@ -383,13 +410,10 @@ inline void drawScrollList(LGFX_Sprite& gfx, const char* title, const char names
     gfx.setFont(strlen(cur) > 9 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
     gfx.drawString(cur, CX, CY + 4);
 
-    if (groupLen > 1) {
-        int n = groupLen > 8 ? 8 : groupLen;
-        constexpr int gap = 12;
-        int x0 = CX - (n - 1) * gap / 2;
-        for (int i = 0; i < n; ++i)
-            gfx.fillCircle(x0 + i * gap, CY + 66, 3, (i == groupFocus) ? COLOR_VALUE : COLOR_LABEL);
-    }
+    // Position in the list, as arc dots (which Rig/Setlist of N). The knob group
+    // (Rig vs Setlist) is conveyed by the title, so no separate group dots here.
+    (void)groupLen; (void)groupFocus;
+    drawArcDots(gfx, count, sel);
     gfx.pushSprite(0, 0);
 }
 
@@ -461,6 +485,7 @@ inline void drawWifiPicker(LGFX_Sprite& gfx, const char ssids[][33], int count, 
     if (sel == 0) snprintf(foot, sizeof(foot), "click = back");
     else          snprintf(foot, sizeof(foot), "%d/%d   click = select", sel, count);
     gfx.drawString(foot, CX, 208);
+    drawArcDots(gfx, total, sel);
     gfx.pushSprite(0, 0);
 }
 
