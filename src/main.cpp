@@ -55,11 +55,10 @@
   #define FW_MANIFEST_URL "https://github.com/kepello/headrush-controller/releases/latest/download/version.json"
 #endif
 
-// Catalog of assignable parameters. Each unit picks one entry in config mode
-// (stored in NVS), so identical firmware can drive any of these. Output/Input/
-// Tempo/Width/EQ are rig-independent; Comp/Reverb write to effect blocks that
-// must be present in the loaded rig. Ranges/formats are from the device's own
-// API schema (headrush-api-tree.json).
+// The global controls — rig-independent engine parameters that exist on every
+// rig (master out/in, tempo, width, global EQ). Anything device-specific (drive,
+// comp, reverb, …) is NOT here; it's resolved live from the loaded rig's chain
+// (see resolveLayoutForRig / gPresent). Ranges/formats from the device's API.
 const ContinuousBinding PARAM_CATALOG[] = {
     { .label = "OUTPUT", .path = "/Evil/Engine/Patch/Output", .prop = "RigVolume",
       .dispMin = -60.0f, .dispMax = +36.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
@@ -79,14 +78,8 @@ const ContinuousBinding PARAM_CATALOG[] = {
     { .label = "TREBLE", .path = "/Evil/Engine/GlobalEQMain", .prop = "Gain4",
       .dispMin = -12.0f, .dispMax = +12.0f, .step = 0.5f, .format = "%+.1f", .unit = "dB",
       .zones = { {-3.0f, 0x6B7F}, {+3.0f, 0x07E0}, {+12.0f, 0xFFE0} }, .zoneCount = 3 },
-    { .label = "COMP", .path = "/Evil/Engine/Patch/Gray_Comp", .prop = "Sustain",
-      .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
-      .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
-    { .label = "REVERB", .path = "/Evil/Engine/Patch/AIR_Reverb", .prop = "Mix",
-      .dispMin = 0.0f, .dispMax = 100.0f, .step = 1.0f, .format = "%.0f", .unit = "%",
-      .zones = { {33.0f, 0x6B7F}, {66.0f, 0x07E0}, {100.0f, 0xFFE0} }, .zoneCount = 3 },
 };
-const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);
+const int PARAM_COUNT = sizeof(PARAM_CATALOG) / sizeof(PARAM_CATALOG[0]);   // 6 globals
 // Selected from the board's view ring in setup(). Read-only after, except a
 // short click (cycle) or config swaps the pointer.
 const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
@@ -431,7 +424,7 @@ int      asgLen = 0;
 
 // Root rows, built from gPresent[] + globals + specials when Assign opens. Each
 // device contributes a primary row + an "all params" drill row.
-const int ASG_GLOBALS = 6;   // catalog 0..5: OUTPUT INPUT TEMPO WIDTH BASS TREBLE
+const int ASG_GLOBALS = PARAM_COUNT;   // every catalog entry is a rig-independent global
 const int ASG_MAXROWS = MAX_PRESENT * 2 + ASG_GLOBALS + 3;
 enum AsgRowKind : uint8_t { ARK_DEV_PRIMARY, ARK_DEV_PARAMS, ARK_GLOBAL, ARK_SPECIAL };
 struct AsgRow { uint8_t kind; int16_t arg; };   // arg = present idx (devices) or view index
