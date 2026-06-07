@@ -23,6 +23,7 @@
 #include "Hardware.h"
 #include "Display.h"
 #include "Binding.h"
+#include "BlockCatalog.h"
 #include "Render.h"
 #include "Roots.h"
 
@@ -96,19 +97,56 @@ const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 const int TUNER_VIEW   = PARAM_COUNT;
 const int SETLIST_VIEW = PARAM_COUNT + 1;
 const int RIG_VIEW     = PARAM_COUNT + 2;
-const int VIEW_COUNT   = PARAM_COUNT + 3;
+// Dynamic, per-rig category dials (Gain bucket / Ambience bucket). These resolve
+// to whatever block fills the slot in the loaded rig (see resolveLayoutForRig).
+// gDynBind[0] backs DYN_GAIN_VIEW, gDynBind[1] backs DYN_SPACE_VIEW.
+const int DYN_GAIN_VIEW  = PARAM_COUNT + 3;
+const int DYN_SPACE_VIEW = PARAM_COUNT + 4;
+const int VIEW_COUNT   = PARAM_COUNT + 5;
 inline bool viewIsTuner(int v)   { return v == TUNER_VIEW; }
 inline bool viewIsSetlist(int v) { return v == SETLIST_VIEW; }
 inline bool viewIsRig(int v)     { return v == RIG_VIEW; }
 inline bool viewIsList(int v)    { return v == SETLIST_VIEW || v == RIG_VIEW; }
+inline bool viewIsDyn(int v)     { return v == DYN_GAIN_VIEW || v == DYN_SPACE_VIEW; }
+inline bool viewIsValid(int v)   { return (v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW
+                                          || v == SETLIST_VIEW || v == RIG_VIEW || viewIsDyn(v); }
+
+// Resolved dynamic dials for the loaded rig. [0] = Gain bucket, [1] = Ambience.
+// The net task fills these from the Chain on every rig change; the UI binds to
+// them via DYN_*_VIEW. ContinuousBinding holds const char* fields, so the runtime
+// strings live in these backing buffers and the struct points into them.
+ContinuousBinding gDynBind[2];
+volatile bool     gDynOk[2] = { false, false };   // did the bucket resolve to a block?
+char gDynLabel[2][12];
+char gDynPath[2][48];
+char gDynProp[2][20];
+volatile uint16_t gPresentCatMask = 0;            // bit c set => BlockCat c present in rig
+volatile bool     layoutDirty = false;            // net -> UI: rebuild Home for the new rig
+
+// Fill gDynBind[slot] from a resolved block. Generic "amount" params are 0..100%
+// (verified against the Prime's object-meta); one display spec covers them all.
+void buildDynBinding(int slot, const char* label, const String& path, const char* prop) {
+    strncpy(gDynLabel[slot], label, sizeof(gDynLabel[slot]) - 1); gDynLabel[slot][sizeof(gDynLabel[slot]) - 1] = 0;
+    strncpy(gDynPath[slot], path.c_str(), sizeof(gDynPath[slot]) - 1); gDynPath[slot][sizeof(gDynPath[slot]) - 1] = 0;
+    strncpy(gDynProp[slot], prop, sizeof(gDynProp[slot]) - 1); gDynProp[slot][sizeof(gDynProp[slot]) - 1] = 0;
+    ContinuousBinding& b = gDynBind[slot];
+    b.label = gDynLabel[slot];
+    b.path  = gDynPath[slot];
+    b.prop  = gDynProp[slot];
+    b.dispMin = 0.0f; b.dispMax = 100.0f; b.step = 1.0f;
+    b.format = "%.0f"; b.unit = "%";
+    b.zones[0] = { 33.0f, 0x6B7F }; b.zones[1] = { 66.0f, 0x07E0 }; b.zones[2] = { 100.0f, 0xFFE0 };
+    b.zoneCount = 3;
+}
 
 // Tuner view shared state. The UI task sets tunerActive when the current ring
 // slot is the Tuner; the net task then mutes the Prime (user's choice) and polls
 // FFTCtrl for the live note + cents, publishing them here under stateMux.
 const char* TUNER_CFG_PATH = "/Evil/Engine/AudioCtrl/Tuner";   // TunerMuting (bool)
 const char* TUNER_FFT_PATH = "/Evil/Engine/FFTCtrl";           // TunerString, TunerCents
-const float TUNER_CENTS_MIN = -50.0f;   // assumed FFTCtrl.TunerCents display range; the
-const float TUNER_CENTS_MAX =  50.0f;   // wire is normalized 0..1 — verify on hardware
+// FFTCtrl is a readout object and delivers RAW values, not the 0..1-normalized
+// wire other params use (confirmed: TunerRef reads 440, meta -100..+100 "Cents").
+// So TunerCents is already in cents — use it directly, don't run wireToDisplay.
 volatile bool tunerActive = false;      // UI: current view is the tuner
 volatile float tunerCents = 0.0f;       // net: latest pitch offset (display cents)
 char tunerNote[8] = "--";               // net writes, UI reads (guarded by stateMux)
@@ -165,6 +203,7 @@ volatile float sharedValue = 0.0f;            // in display units (e.g. dB)
 volatile float pendingWriteValue = 0;
 volatile bool  pendingWriteValid = false;
 volatile uint32_t lastLocalChangeMs = 0;
+volatile bool  rigChangedReq = false;   // WS push said the rig changed; net re-resolves the layout
 
 // OTA state. Written by ArduinoOTA callbacks on the net task, read by the UI
 // task to render the progress screen. Plain volatile is sufficient — these are
@@ -261,6 +300,15 @@ void bindControl(int v) {
         libReqDone = false;
         if (viewIsSetlist(v)) libFetchSetlistsReq = true;
         else                  fetchRigListReq = true;
+    } else if (viewIsDyn(v)) {
+        int s = v - DYN_GAIN_VIEW;             // 0 = Gain, 1 = Ambience
+        if (gDynOk[s]) {
+            activeBinding = &gDynBind[s];
+        } else {
+            // Sparse rig: the bucket had no block. Fall back to a global so the
+            // dial still does something useful (Tempo for gain, Width for space).
+            activeBinding = &PARAM_CATALOG[s == 0 ? 2 : 3];
+        }
     } else {
         if (v < 0 || v >= PARAM_COUNT) v = 0;
         paramIndex = v;
@@ -358,6 +406,72 @@ void saveHomeGroup() {
     Serial.printf("[nvs] home group len=%d focus=%d\n", homeGroupLen, homeFocus);
 }
 
+// Per-rig HOME assignment (UX_MODEL §5). Keyed by the rig's stable loadedID so a
+// board adopts that rig's saved layout on load and falls back to generated
+// defaults otherwise. NVS keys are short (<=15 chars), so we hash the UUID into
+// "h<8 hex>l" (len) / "h<8 hex>g" (group bytes).
+void rigNvsKeys(const char* rigId, char* lenKey, char* grpKey) {
+    uint32_t h = 2166136261u;                         // FNV-1a over the rig id
+    for (const char* s = rigId; *s; ++s) { h ^= (uint8_t)*s; h *= 16777619u; }
+    snprintf(lenKey, 12, "h%08lxl", (unsigned long)h);
+    snprintf(grpKey, 12, "h%08lxg", (unsigned long)h);
+}
+
+bool loadHomeForRig(const char* rigId) {
+    if (!rigId || !rigId[0]) return false;
+    char lk[12], gk[12]; rigNvsKeys(rigId, lk, gk);
+    Preferences p; p.begin("hrctrl", true);
+    int len = p.getInt(lk, 0);
+    int tmp[VIEW_COUNT];
+    bool ok = false;
+    if (len >= 1 && len <= VIEW_COUNT && p.getBytes(gk, tmp, len * sizeof(int)) == len * sizeof(int)) {
+        int n = 0;
+        for (int i = 0; i < len; ++i) if (viewIsValid(tmp[i])) homeGroup[n++] = tmp[i];
+        if (n > 0) { homeGroupLen = n; ok = true; }
+    }
+    p.end();
+    if (ok) Serial.printf("[nvs] loaded rig layout %s len=%d\n", rigId, homeGroupLen);
+    return ok;
+}
+
+void saveHomeForRig(const char* rigId) {
+    if (!rigId || !rigId[0]) return;
+    char lk[12], gk[12]; rigNvsKeys(rigId, lk, gk);
+    Preferences p; p.begin("hrctrl", false);
+    p.putInt(lk, homeGroupLen);
+    p.putBytes(gk, homeGroup, homeGroupLen * sizeof(int));
+    p.end();
+    Serial.printf("[nvs] saved rig layout %s len=%d\n", rigId, homeGroupLen);
+}
+
+// Generate this board's default HOME for the loaded rig (UX_MODEL §5). The role
+// is by device id (1..4 -> nav / gain / ambience / levels); >4 wraps. The Gain
+// and Ambience dials are DYN views whose concrete block was resolved by the net
+// task; here we only decide which dial this board carries.
+void generateDefaultHome() {
+    int role = (deviceId - 1) % 4;
+    switch (role) {
+        case 0:  homeGroup[0] = RIG_VIEW; homeGroup[1] = SETLIST_VIEW; homeGroupLen = 2; break;
+        case 1:  homeGroup[0] = DYN_GAIN_VIEW;  homeGroupLen = 1; break;
+        case 2:  homeGroup[0] = DYN_SPACE_VIEW; homeGroupLen = 1; break;
+        default: homeGroup[0] = 0; homeGroup[1] = 1; homeGroupLen = 2; break;  // OUTPUT, INPUT
+    }
+    Serial.printf("[layout] default home for board %d role %d len %d\n", deviceId, role, homeGroupLen);
+}
+
+// Rebuild HOME when a new rig loads: adopt the saved per-rig layout or fall back
+// to the generated default, then refocus (which re-primes the displayed value).
+// Called from the UI task when the net task raises layoutDirty.
+void rebuildHomeForRig() {
+    char rigId[40];
+    portENTER_CRITICAL(&stateMux);
+    strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
+    portEXIT_CRITICAL(&stateMux);
+    if (!loadHomeForRig(rigId)) generateDefaultHome();
+    homeFocus = 0;
+    focusHomeMember(0);
+}
+
 bool connectWifi(const WifiCreds& c) {
     if (c.ssid.length() == 0) { Serial.println("No WiFi creds"); return false; }
     Serial.printf("WiFi → %s\n", c.ssid.c_str());
@@ -398,6 +512,7 @@ void onValueChanged(const String& path, const String& prop, const JsonVariantCon
         portENTER_CRITICAL(&stateMux);
         strncpy(libCurrentRigName, nm ? nm : "", 39); libCurrentRigName[39] = 0;
         portEXIT_CRITICAL(&stateMux);
+        rigChangedReq = true;   // rig swapped (footswitch / other controller) — re-resolve layout
     } else if (path == LIB_SETLISTS_PATH && prop == "loadedName" && value.is<const char*>()) {
         const char* nm = value.as<const char*>();
         portENTER_CRITICAL(&stateMux);
@@ -452,7 +567,7 @@ void serviceTuner() {
         lastPollMs = millis();
         JsonDocument doc;
         if (hr.getProperties(TUNER_FFT_PATH, doc)) {
-            float cents = HR::wireToDisplay(doc["TunerCents"].as<float>(), TUNER_CENTS_MIN, TUNER_CENTS_MAX);
+            float cents = doc["TunerCents"].as<float>();   // raw cents (FFTCtrl is not normalized)
             const char* note = doc["TunerString"].is<const char*>() ? doc["TunerString"].as<const char*>() : "--";
             portENTER_CRITICAL(&stateMux);
             tunerCents = cents;
@@ -513,6 +628,67 @@ void doFetchRigList() {
         portEXIT_CRITICAL(&stateMux);
     }
     libReqDone = true;
+}
+
+// Resolve the per-rig dynamic dials from the loaded rig's signal chain (net task).
+// Walks the 14 chain slots in order, maps each to a generic category, then fills
+// the Gain dial (Drive>Amp>Comp) and Ambience dial (Reverb>Delay>Mod>Filter>Pitch)
+// from the first present block in each bucket. Empty buckets cross-fill from the
+// other. The chosen primary param is the first candidate the actual block exposes.
+void resolveLayoutForRig() {
+    gDynOk[0] = gDynOk[1] = false;
+    JsonDocument chain;
+    if (!hr.getProperties("/Evil/Engine/Patch/Chain", chain)) {
+        Serial.println("[layout] chain fetch FAIL");
+        layoutDirty = true;   // still let the UI rebuild (dials fall back to globals)
+        return;
+    }
+    // First chain slot (1-based, chain order) holding each generic category.
+    int firstSlotForCat[BC_COUNT];
+    for (int i = 0; i < BC_COUNT; ++i) firstSlotForCat[i] = -1;
+    uint16_t mask = 0;
+    for (int slot = 1; slot <= 14; ++slot) {
+        char key[16]; snprintf(key, sizeof(key), "ModuleType%d", slot);
+        int idx = chain[key] | 0;
+        BlockCat c = moduleCategory(idx);
+        if (c == BC_NONE) continue;
+        mask |= (uint16_t)(1u << c);
+        if (firstSlotForCat[c] < 0) firstSlotForCat[c] = idx;   // store module idx
+    }
+    gPresentCatMask = mask;
+
+    // Pick the first present category from a bucket whose block exposes a usable
+    // param, build gDynBind[slot], and return the category used (or BC_NONE).
+    auto fill = [&](int dslot, const BlockCat* bucket, int bn, BlockCat exclude) -> BlockCat {
+        for (int i = 0; i < bn; ++i) {
+            BlockCat c = bucket[i];
+            if (c == exclude || firstSlotForCat[c] < 0) continue;
+            const CatBindSpec* spec = catBindSpec(c);
+            if (!spec) continue;
+            String path = moduleBlockPath(firstSlotForCat[c]);
+            if (path.isEmpty()) continue;
+            JsonDocument bd;
+            if (!hr.getProperties(path, bd)) continue;
+            for (int k = 0; k < 4 && spec->candidates[k]; ++k) {
+                if (bd[spec->candidates[k]].is<float>()) {
+                    buildDynBinding(dslot, spec->label, path, spec->candidates[k]);
+                    gDynOk[dslot] = true;
+                    Serial.printf("[layout] dial%d = %s %s.%s\n", dslot + 1, spec->label,
+                                  path.c_str(), spec->candidates[k]);
+                    return c;
+                }
+            }
+        }
+        return BC_NONE;
+    };
+
+    BlockCat gainCat  = fill(0, GAIN_BUCKET, GAIN_BUCKET_COUNT, BC_NONE);
+    BlockCat spaceCat = fill(1, SPACE_BUCKET, SPACE_BUCKET_COUNT, gainCat);
+    // Cross-fill: a board with an empty bucket borrows the other bucket's leftover.
+    if (!gDynOk[0]) gainCat  = fill(0, SPACE_BUCKET, SPACE_BUCKET_COUNT, spaceCat);
+    if (!gDynOk[1]) spaceCat = fill(1, GAIN_BUCKET,  GAIN_BUCKET_COUNT,  gainCat);
+
+    layoutDirty = true;   // tell the UI to rebuild HOME from the new layout
 }
 
 // Load the setlist whose id is in libSelSetlistId.
@@ -766,6 +942,7 @@ void netTask(void*) {
         });
         hr.begin(host);
         primeInitialValue();
+        rigChangedReq = true;   // resolve the loaded rig's layout once the link is up
         setupOTA();
         if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
             // Stagger the boot update-check so a rack of boards powered on together
@@ -790,6 +967,7 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
+            if (rigChangedReq) { rigChangedReq = false; doFetchRigList(); resolveLayoutForRig(); }  // rig swapped -> re-resolve dials
             if (rebindRequested) { rebindRequested = false; if (!tunerActive && !homeListActive) primeInitialValue(); }  // new control focused
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
             if (fetchRigListReq)     { fetchRigListReq = false; doFetchRigList(); }
@@ -860,7 +1038,7 @@ void setup() {
     int n = 0;
     for (int i = 0; i < homeGroupLen && i < VIEW_COUNT; ++i) {
         int v = homeGroup[i];
-        if ((v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW || v == SETLIST_VIEW || v == RIG_VIEW) homeGroup[n++] = v;
+        if (viewIsValid(v)) homeGroup[n++] = v;
     }
     homeGroupLen = (n > 0) ? n : 1;
     if (n == 0) homeGroup[0] = 0;
@@ -898,6 +1076,16 @@ void loop() {
     // let it dim after a spell of no activity.
     if (otaActive || otaChecking || !bootComplete) noteActivity();
     updateBacklight();
+
+    // A rig change (net task resolved a new layout): adopt this rig's saved HOME
+    // assignment or the generated default, then refocus to refresh the dial. Only
+    // rebuild while on HOME — a menu the user is in shouldn't yank out from under
+    // them; the new layout takes effect when they return to HOME.
+    if (layoutDirty && screen == SC_HOME) {
+        layoutDirty = false;
+        rebuildHomeForRig();
+        lastRenderedValue = -999999.0f;   // force a redraw with the new value
+    }
 
     // Net-driven overlays take priority over everything, including config mode:
     // a download/flash may be running on the other core. Redraw only on a mode
@@ -1008,7 +1196,12 @@ void loop() {
             if (assignSelLen > 0) {
                 homeGroupLen = assignSelLen;
                 for (int i = 0; i < assignSelLen; ++i) homeGroup[i] = assignSel[i];
-                saveHomeGroup();
+                saveHomeGroup();              // global fallback (used until a rig is known)
+                char rigId[40];              // and persist this layout for the loaded rig
+                portENTER_CRITICAL(&stateMux);
+                strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
+                portEXIT_CRITICAL(&stateMux);
+                saveHomeForRig(rigId);
                 focusHomeMember(0);
             }
             screen = SC_HOME;

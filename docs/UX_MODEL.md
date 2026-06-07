@@ -81,10 +81,39 @@ A board's HOME assignment is **per rig**, not global.
   offers controls the loaded rig actually contains (no phaser block ⇒ no phaser
   control). Existence is read from `/Evil/Engine/Patch/Chain` module/effect
   slots, plus the always-present globals.
-- **Unconfigured rig ⇒ sensible defaults** derived from its blocks, e.g.
-  board1=Output, board2=first drive's gain, board3=reverb mix, board4=delay mix.
+- **Unconfigured rig ⇒ sensible defaults** derived from its blocks (the default
+  layout, below).
 - **Reassigning a knob saves that layout for the current rig.** A new rig starts
   from the sensible defaults.
+
+### Default layout (applied when a rig has no saved assignment)
+
+Agreed 2026-06-03. Each of the 4 boards (by device id 1–4) gets a role:
+
+| Board | Role | Default assignment | Top member |
+|---|---|---|---|
+| 1 | Navigation | group `[Rig, Setlist]` | **Rig** |
+| 2 | Gain / character | top present of the **Gain bucket** | (single param) |
+| 3 | Ambience / space | top present of the **Ambience bucket** | (single param) |
+| 4 | Levels | group `[Output, Input]` (+ per-block `Level`, later) | **Output** |
+
+Dials 2 & 3 use **two complementary buckets** rather than a flat priority list,
+so any rig yields one gain knob *and* one space knob:
+
+- **Gain bucket** (dial 2), first present: **Drive → Amp → Compressor**
+  - Drive → `Drive` · Amp → `GainA` · Compressor → `Sustain`
+- **Ambience bucket** (dial 3), first present: **Reverb → Delay → Mod → Filter → Pitch**
+  - Reverb/Delay/Mod/Pitch → `Mix` · Filter → `Freq`
+
+**Cross-fill:** if a bucket is empty, that dial borrows the next-priority unused
+type from the other bucket; if the rig is sparse (amp+cab only), it falls back to
+a global (Tempo/Width). Duplicate blocks → first in chain order; parallel `_2`
+path blocks are ignored for defaults.
+
+Each board carries the *category* (generic "Drive", "Reverb", …), not a specific
+block — on rig load the net task resolves the category to whatever block fills
+that slot in the loaded rig (`/Evil/Engine/Patch/{Block}`), so "compression" maps
+to whichever compressor the rig actually uses.
 
 ### Storage — NVS per board
 
@@ -111,6 +140,15 @@ be layered on later without rework.
 - **Rig-dependent (shown when the block exists):** Drive gain, Mod mix/rate,
   Delay mix/time/feedback, Reverb mix/decay, Comp sustain — mapped to the rig's
   actual blocks under `/Evil/Engine/Patch/{Block}`.
+
+**Generic categorization is authoritative, not heuristic.** Every block's
+category comes from the Prime itself (`/Evil/API/Blocks.categoryOfBlock` /
+`categoryBlocks`), collapsed to the generic set the generator reasons about. The
+chain slot's `ModuleTypeN` is an index into `Blocks.ModuleTypes`; the firmware
+ships a precomputed `ModuleType → category` table (`src/BlockCatalog.h`,
+generated from the device — regenerate if Prime firmware reorders the list). The
+primary param per category is resolved against the actual block's properties
+(first candidate that exists wins), since blocks in a category aren't identical.
 
 ## 7. Functional scope (all four groups in scope; phase as needed)
 
