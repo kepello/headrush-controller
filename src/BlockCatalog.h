@@ -331,6 +331,30 @@ inline BlockCat moduleCategory(int idx) {
     return (BlockCat)pgm_read_byte(&MODULE_CATEGORY[idx]);
 }
 
+inline String moduleName(int idx) {
+    if (idx < 0 || idx >= MODULE_TYPE_COUNT) return String();
+    return String((const char*)pgm_read_ptr(&MODULE_NAME[idx]));
+}
+
+// Map the Prime's own display category string (from categoryOfBlock /
+// BlockSelectorCategoriesForDisplay) to a generic BlockCat. Stable across device
+// content downloads (only firmware updates add categories), so this is the
+// runtime-authoritative path: a newly added block still reports one of these.
+inline BlockCat genericCatFromDeviceString(const char* s) {
+    if (!s || !s[0]) return BC_NONE;
+    struct M { const char* k; BlockCat c; };
+    static const M m[] = {
+        { "Amp", BC_AMP }, { "Cab/IR", BC_CAB }, { "Clone", BC_CLONE }, { "Vocal", BC_VOCAL },
+        { "Overdrive", BC_DRIVE }, { "Distortion/Fuzz", BC_DRIVE }, { "EQ", BC_EQ },
+        { "Compressor", BC_COMP }, { "Delay", BC_DELAY }, { "Reverb", BC_REVERB },
+        { "Chorus", BC_MOD }, { "Phaser/Flanger", BC_MOD }, { "Vib/Trem/Rotary", BC_MOD },
+        { "Wah/Filter", BC_FILTER }, { "Pitch", BC_PITCH }, { "Volume/Dynamics", BC_DYN },
+        { "Rhythmic", BC_RHY }, { "Synth", BC_SYNTH }, { "Utility", BC_UTIL }, { "FX-Loop", BC_FXLOOP },
+    };
+    for (const auto& e : m) if (strcmp(s, e.k) == 0) return e.c;
+    return BC_NONE;
+}
+
 // Build "/Evil/Engine/Patch/<name>" for a module index (spaces/slash -> _).
 inline String moduleBlockPath(int idx) {
     if (idx <= 0 || idx >= MODULE_TYPE_COUNT) return String();
@@ -352,20 +376,24 @@ inline String moduleBlockPath(int idx) {
 struct CatBindSpec {
     BlockCat cat;
     const char* label;            // on-screen label for the dial
-    const char* candidates[4];    // ordered prop names; first present on the block wins
+    const char* candidates[5];    // ordered prop names; first present on the block wins
 };
 
 // Only the categories the default generator can put on a dial. Order within a
-// list is the preference; nullptr terminates.
+// list is the preference; nullptr terminates. Candidate names are category
+// CONVENTIONS (verified against real blocks), not per-device — a new block in a
+// category exposes one of these, so downloads/new models resolve without a table
+// edit. Different blocks in one category genuinely differ (Gray Comp = Sustain,
+// Budda Comp = Compression; an OD = Drive, a fuzz = Fuzz), hence the lists.
 const CatBindSpec CAT_BIND[] = {
-    { BC_DRIVE,  "DRIVE",  { "Drive", "Gain", "Level", nullptr } },
-    { BC_AMP,    "GAIN",   { "GainA", "Master", nullptr, nullptr } },
-    { BC_COMP,   "COMP",   { "Sustain", "Level", nullptr, nullptr } },
-    { BC_REVERB, "REVERB", { "Mix", nullptr, nullptr, nullptr } },
-    { BC_DELAY,  "DELAY",  { "Mix", "Feedback", nullptr, nullptr } },
-    { BC_MOD,    "MOD",    { "Mix", "Depth", "Rate", nullptr } },
-    { BC_FILTER, "FILTER", { "Freq", "Mix", nullptr, nullptr } },
-    { BC_PITCH,  "PITCH",  { "Mix", nullptr, nullptr, nullptr } },
+    { BC_DRIVE,  "DRIVE",  { "Drive", "Gain", "Fuzz", "Distortion", nullptr } },
+    { BC_AMP,    "GAIN",   { "GainA", "Gain", "Master", nullptr, nullptr } },
+    { BC_COMP,   "COMP",   { "Sustain", "Compression", nullptr, nullptr, nullptr } },
+    { BC_REVERB, "REVERB", { "Mix", nullptr, nullptr, nullptr, nullptr } },
+    { BC_DELAY,  "DELAY",  { "Mix", "DelayFdbk", "Feedback", nullptr, nullptr } },
+    { BC_MOD,    "MOD",    { "Mix", "Depth", "RotSpeed", "Rate", nullptr } },
+    { BC_FILTER, "FILTER", { "Sensitivity", "Range", "Mix", "Freq", nullptr } },
+    { BC_PITCH,  "PITCH",  { "Mix", "Pitch", nullptr, nullptr, nullptr } },
 };
 const int CAT_BIND_COUNT = sizeof(CAT_BIND) / sizeof(CAT_BIND[0]);
 

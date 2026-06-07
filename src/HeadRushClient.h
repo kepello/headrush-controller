@@ -29,6 +29,7 @@ public:
 
     // HTTP — blocking. Returns true on 2xx.
     bool getProperties(const String& path, JsonDocument& out);
+    bool getMeta(const String& path, JsonDocument& out);   // object-meta (min/max/format per prop)
     bool setProperties(const String& path, const JsonVariantConst& propsObj);
     bool callMethod(const String& path, const String& method, const JsonVariantConst& args, JsonDocument& out);
 

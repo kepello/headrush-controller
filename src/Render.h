@@ -78,11 +78,19 @@ inline void drawContinuous(LGFX_Sprite& gfx, const ContinuousBinding& cb, float 
         gfx.fillArc(CX, CY, ARC_INNER_R, ARC_OUTER_R, a0, a1, color);
     }
 
-    // Label at the top inside the arc.
+    // Label at the top inside the arc — the generic category (e.g. "COMP").
     gfx.setTextDatum(middle_center);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString(cb.label, CX, CY - 50);
+    gfx.drawString(cb.label, CX, cb.device && cb.device[0] ? CY - 56 : CY - 50);
+
+    // Device subtitle (small): which actual block this category resolved to, so
+    // a rig with several of one type shows e.g. "Gray Comp" under "COMP".
+    if (cb.device && cb.device[0]) {
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.setFont(&fonts::FreeSans9pt7b);
+        gfx.drawString(cb.device, CX, CY - 34);
+    }
 
     // Big value text.
     gfx.setTextColor(COLOR_VALUE, COLOR_BG);

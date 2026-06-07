@@ -50,6 +50,10 @@ bool HeadRushClient::getProperties(const String& path, JsonDocument& out) {
     return httpRequest("GET", _baseUrl + "/object-properties" + path, String(), &out);
 }
 
+bool HeadRushClient::getMeta(const String& path, JsonDocument& out) {
+    return httpRequest("GET", _baseUrl + "/object-meta" + path, String(), &out);
+}
+
 bool HeadRushClient::setProperties(const String& path, const JsonVariantConst& propsObj) {
     String body;
     serializeJson(propsObj, body);

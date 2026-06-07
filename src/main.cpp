@@ -117,25 +117,55 @@ inline bool viewIsValid(int v)   { return (v >= 0 && v < PARAM_COUNT) || v == TU
 // strings live in these backing buffers and the struct points into them.
 ContinuousBinding gDynBind[2];
 volatile bool     gDynOk[2] = { false, false };   // did the bucket resolve to a block?
-char gDynLabel[2][12];
+char gDynLabel[2][12];                             // big label = generic category ("COMP")
+char gDynDevice[2][24];                            // small subtitle = actual block ("Gray Comp")
 char gDynPath[2][48];
 char gDynProp[2][20];
+char gDynFmt[2][12];                               // printf format, parsed from device meta
+char gDynUnit[2][8];                               // unit suffix, parsed from device meta
 volatile uint16_t gPresentCatMask = 0;            // bit c set => BlockCat c present in rig
 volatile bool     layoutDirty = false;            // net -> UI: rebuild Home for the new rig
+int8_t gCatCache[MODULE_TYPE_COUNT];              // module idx -> BlockCat, -1 = not yet asked (net task)
 
-// Fill gDynBind[slot] from a resolved block. Generic "amount" params are 0..100%
-// (verified against the Prime's object-meta); one display spec covers them all.
-void buildDynBinding(int slot, const char* label, const String& path, const char* prop) {
-    strncpy(gDynLabel[slot], label, sizeof(gDynLabel[slot]) - 1); gDynLabel[slot][sizeof(gDynLabel[slot]) - 1] = 0;
+// Split a HeadRush meta format ("%.0f %%", "%.1f Cents", "%+.1f dB") into a bare
+// printf format ("%.0f") + unit ("%", "Cents", "dB"). The Prime embeds the unit
+// after the conversion; we draw it separately. "%%" decodes to a literal "%".
+void splitDeviceFormat(const char* dev, char* fmt, size_t fl, char* unit, size_t ul) {
+    if (!dev || !dev[0]) { strncpy(fmt, "%.0f", fl); strncpy(unit, "%", ul); fmt[fl-1]=0; unit[ul-1]=0; return; }
+    size_t i = 0;
+    while (dev[i]) { char c = dev[i++]; if (c=='f'||c=='d'||c=='g'||c=='e'||c=='i'||c=='u') break; }
+    size_t n = i < fl - 1 ? i : fl - 1;
+    memcpy(fmt, dev, n); fmt[n] = 0;
+    while (dev[i] == ' ') i++;
+    size_t u = 0;
+    for (; dev[i] && u < ul - 1; ++i) { if (dev[i]=='%' && dev[i+1]=='%') continue; unit[u++] = dev[i]; }
+    unit[u] = 0;
+}
+
+// Fill gDynBind[slot] from a resolved block: generic category label, the actual
+// device name (subtitle), and the display spec (range/format) read live from the
+// Prime's object-meta — so any param, with any unit/range, renders correctly.
+void buildDynBinding(int slot, const char* label, const char* device, const String& path,
+                     const char* prop, float dispMin, float dispMax, const char* devFormat) {
+    strncpy(gDynLabel[slot], label, sizeof(gDynLabel[slot]) - 1);   gDynLabel[slot][sizeof(gDynLabel[slot]) - 1] = 0;
+    strncpy(gDynDevice[slot], device ? device : "", sizeof(gDynDevice[slot]) - 1); gDynDevice[slot][sizeof(gDynDevice[slot]) - 1] = 0;
     strncpy(gDynPath[slot], path.c_str(), sizeof(gDynPath[slot]) - 1); gDynPath[slot][sizeof(gDynPath[slot]) - 1] = 0;
-    strncpy(gDynProp[slot], prop, sizeof(gDynProp[slot]) - 1); gDynProp[slot][sizeof(gDynProp[slot]) - 1] = 0;
+    strncpy(gDynProp[slot], prop, sizeof(gDynProp[slot]) - 1);      gDynProp[slot][sizeof(gDynProp[slot]) - 1] = 0;
+    splitDeviceFormat(devFormat, gDynFmt[slot], sizeof(gDynFmt[slot]), gDynUnit[slot], sizeof(gDynUnit[slot]));
+    if (dispMax <= dispMin) { dispMin = 0.0f; dispMax = 100.0f; }
     ContinuousBinding& b = gDynBind[slot];
     b.label = gDynLabel[slot];
+    b.device = gDynDevice[slot];
     b.path  = gDynPath[slot];
     b.prop  = gDynProp[slot];
-    b.dispMin = 0.0f; b.dispMax = 100.0f; b.step = 1.0f;
-    b.format = "%.0f"; b.unit = "%";
-    b.zones[0] = { 33.0f, 0x6B7F }; b.zones[1] = { 66.0f, 0x07E0 }; b.zones[2] = { 100.0f, 0xFFE0 };
+    b.dispMin = dispMin; b.dispMax = dispMax;
+    float range = dispMax - dispMin;
+    b.step = range > 20.0f ? 1.0f : range / 100.0f;   // ~1 unit/detent for %, finer for small ranges
+    b.format = gDynFmt[slot]; b.unit = gDynUnit[slot];
+    // Zones scaled to thirds of the range so arc colors work for any unit.
+    b.zones[0] = { dispMin + range * 0.33f, 0x6B7F };
+    b.zones[1] = { dispMin + range * 0.66f, 0x07E0 };
+    b.zones[2] = { dispMax,                 0xFFE0 };
     b.zoneCount = 3;
 }
 
@@ -519,6 +549,10 @@ void onValueChanged(const String& path, const String& prop, const JsonVariantCon
         strncpy(libCurrentSetlistName, nm ? nm : "", 39); libCurrentSetlistName[39] = 0;
         portEXIT_CRITICAL(&stateMux);
     }
+    // Editing a rig (swap/add/remove a block) changes the Chain but not the rig
+    // name, so re-resolve on any Chain structure change too — covers edits made
+    // on the Prime or anywhere, not just rig selection.
+    if (path == "/Evil/Engine/Patch/Chain") rigChangedReq = true;
     // Param echo for the active dial.
     if (path != activeBinding->path || prop != activeBinding->prop) return;
     portENTER_CRITICAL(&stateMux);
@@ -630,11 +664,33 @@ void doFetchRigList() {
     libReqDone = true;
 }
 
+// Generic category for a chain module index, asked from the Prime itself
+// (categoryOfBlock) so a newly added/downloaded block categorizes correctly,
+// cached per index for the session. Falls back to the baked table if the device
+// call fails. Net task only.
+BlockCat resolveCat(int idx) {
+    if (idx <= 0 || idx >= MODULE_TYPE_COUNT) return BC_NONE;
+    if (gCatCache[idx] >= 0) return (BlockCat)gCatCache[idx];
+    BlockCat c = moduleCategory(idx);          // baked fallback (pre-seeded snapshot)
+    String name = moduleName(idx);
+    if (name.length()) {
+        JsonDocument args; JsonArray a = args.to<JsonArray>(); a.add(name);
+        JsonDocument res;
+        if (hr.callMethod("/Evil/API/Blocks", "categoryOfBlock", args.as<JsonVariantConst>(), res)) {
+            BlockCat rc = genericCatFromDeviceString(res["methodReturnValue"] | "");
+            if (rc != BC_NONE) c = rc;
+        }
+    }
+    gCatCache[idx] = (int8_t)c;
+    return c;
+}
+
 // Resolve the per-rig dynamic dials from the loaded rig's signal chain (net task).
-// Walks the 14 chain slots in order, maps each to a generic category, then fills
-// the Gain dial (Drive>Amp>Comp) and Ambience dial (Reverb>Delay>Mod>Filter>Pitch)
-// from the first present block in each bucket. Empty buckets cross-fill from the
-// other. The chosen primary param is the first candidate the actual block exposes.
+// Walks the 14 chain slots in order, maps each to a generic category (asked from
+// the Prime), then fills the Gain dial (Drive>Amp>Comp) and Ambience dial
+// (Reverb>Delay>Mod>Filter>Pitch) from the first present block in each bucket.
+// Empty buckets cross-fill from the other. The primary param is the first
+// candidate the actual block exposes; its range/format come from object-meta.
 void resolveLayoutForRig() {
     gDynOk[0] = gDynOk[1] = false;
     JsonDocument chain;
@@ -650,7 +706,7 @@ void resolveLayoutForRig() {
     for (int slot = 1; slot <= 14; ++slot) {
         char key[16]; snprintf(key, sizeof(key), "ModuleType%d", slot);
         int idx = chain[key] | 0;
-        BlockCat c = moduleCategory(idx);
+        BlockCat c = resolveCat(idx);
         if (c == BC_NONE) continue;
         mask |= (uint16_t)(1u << c);
         if (firstSlotForCat[c] < 0) firstSlotForCat[c] = idx;   // store module idx
@@ -665,18 +721,32 @@ void resolveLayoutForRig() {
             if (c == exclude || firstSlotForCat[c] < 0) continue;
             const CatBindSpec* spec = catBindSpec(c);
             if (!spec) continue;
-            String path = moduleBlockPath(firstSlotForCat[c]);
+            int idx = firstSlotForCat[c];
+            String path = moduleBlockPath(idx);
             if (path.isEmpty()) continue;
             JsonDocument bd;
             if (!hr.getProperties(path, bd)) continue;
-            for (int k = 0; k < 4 && spec->candidates[k]; ++k) {
-                if (bd[spec->candidates[k]].is<float>()) {
-                    buildDynBinding(dslot, spec->label, path, spec->candidates[k]);
-                    gDynOk[dslot] = true;
-                    Serial.printf("[layout] dial%d = %s %s.%s\n", dslot + 1, spec->label,
-                                  path.c_str(), spec->candidates[k]);
-                    return c;
+            for (int k = 0; k < 5 && spec->candidates[k]; ++k) {
+                const char* prop = spec->candidates[k];
+                if (!bd[prop].is<float>()) continue;
+                // Range + format live from the device so any unit renders right.
+                float mn = 0, mx = 100; const char* fmt = "%.0f %%";
+                JsonDocument md;
+                if (hr.getMeta(path, md)) {
+                    JsonVariantConst pm = md["properties"][prop];
+                    if (!pm.isNull()) {
+                        if (pm["minimum"].is<float>()) mn = pm["minimum"].as<float>();
+                        if (pm["maximum"].is<float>()) mx = pm["maximum"].as<float>();
+                        const char* f = pm["x-options"]["format"] | "";
+                        if (f[0]) fmt = f;
+                    }
                 }
+                String dev = moduleName(idx);
+                buildDynBinding(dslot, spec->label, dev.c_str(), path, prop, mn, mx, fmt);
+                gDynOk[dslot] = true;
+                Serial.printf("[layout] dial%d = %s [%s] %s.%s\n", dslot + 1, spec->label,
+                              dev.c_str(), path.c_str(), prop);
+                return c;
             }
         }
         return BC_NONE;
@@ -1005,6 +1075,8 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.printf("\n=== HeadRush Controller — Stage 1B (fw %d) ===\n", FW_VERSION);
+
+    memset(gCatCache, -1, sizeof(gCatCache));   // block categories asked lazily from the Prime
 
     // Ensure NVS is healthy. If the partition is in a bad/old state, the core
     // may not have reformatted it, making Preferences writes succeed in-session

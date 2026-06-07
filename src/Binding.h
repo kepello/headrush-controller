@@ -13,6 +13,10 @@
 
 struct ContinuousBinding {
     const char* label;       // short on-screen label, e.g. "OUT", "TEMPO"
+    // Optional small subtitle under the label: the specific device behind a
+    // generic category dial, e.g. label "COMP" + device "Gray Comp". nullptr for
+    // globals (Output/Tempo/…) where the label already names the thing.
+    const char* device = nullptr;
     const char* path;        // "/Evil/Engine/Patch/Output"
     const char* prop;        // "RigVolume"
     float dispMin, dispMax;  // display units, e.g. -60..+36 dB
