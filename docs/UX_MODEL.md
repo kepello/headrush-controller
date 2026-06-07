@@ -141,14 +141,17 @@ be layered on later without rework.
   Delay mix/time/feedback, Reverb mix/decay, Comp sustain — mapped to the rig's
   actual blocks under `/Evil/Engine/Patch/{Block}`.
 
-**Generic categorization is authoritative, not heuristic.** Every block's
-category comes from the Prime itself (`/Evil/API/Blocks.categoryOfBlock` /
-`categoryBlocks`), collapsed to the generic set the generator reasons about. The
-chain slot's `ModuleTypeN` is an index into `Blocks.ModuleTypes`; the firmware
-ships a precomputed `ModuleType → category` table (`src/BlockCatalog.h`,
-generated from the device — regenerate if Prime firmware reorders the list). The
-primary param per category is resolved against the actual block's properties
-(first candidate that exists wins), since blocks in a category aren't identical.
+**Generic categorization is authoritative and fully runtime, not baked.** Every
+block's category comes from the Prime itself (`/Evil/API/Blocks.categoryOfBlock`),
+collapsed to the generic set the generator reasons about. The chain slot's
+`ModuleTypeN` is an index into `Blocks.ModuleTypes`, which the firmware fetches
+live and caches (`src/BlockCatalog.h` holds **no** baked snapshot — only the
+generic taxonomy + param conventions). A stale local copy is deliberately
+avoided: it would let resolution succeed with the wrong blocks after a firmware
+reorder, silently. If the live block list can't load, the dial shows the
+resolving spinner and retries rather than guessing. The primary param per
+category is resolved against the actual block's properties (first candidate that
+exists wins), since blocks in a category aren't identical.
 
 ## 7. Functional scope (all four groups in scope; phase as needed)
 

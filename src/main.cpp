@@ -141,6 +141,7 @@ volatile uint16_t gPresentCatMask = 0;            // bit c set => BlockCat c pre
 volatile bool     layoutDirty = false;            // net -> UI: a new resolved group is published
 volatile bool     gResolving = false;             // net -> UI: resolution in flight (show a spinner)
 int8_t gCatCache[MAX_MODTYPES];                   // module idx -> BlockCat, -1 = not yet asked (net task)
+volatile bool gBlocksOk = false;                  // live ModuleTypes loaded? (no resolution before this)
 
 // The loaded rig's devices, built live from the Chain by the net task (never
 // persisted — the rig can change on the Prime while we're disconnected). Doubles
@@ -898,9 +899,9 @@ void doFetchRigList() {
 // so resolution uses the Prime's current block list rather than the baked
 // snapshot — robust to firmware updates / new blocks. Net task only; idempotent.
 void loadModuleTypes() {
-    if (gModCountRT > 0 || !gModNameRT) return;
+    if (gBlocksOk || !gModNameRT) return;
     JsonDocument doc;
-    if (!hr.getProperties("/Evil/API/Blocks", doc)) return;
+    if (!hr.getProperties("/Evil/API/Blocks", doc)) { Serial.println("[blocks] ModuleTypes fetch FAILED — will retry"); return; }
     JsonArrayConst mt = doc["ModuleTypes"].as<JsonArrayConst>();
     int n = 0;
     for (size_t i = 0; i < mt.size() && n < MAX_MODTYPES; ++i) {
@@ -909,7 +910,8 @@ void loadModuleTypes() {
     }
     if (n > 0) {
         gModCountRT = n;
-        memset(gCatCache, -1, sizeof(gCatCache));   // indices may have shifted vs the baked table
+        gBlocksOk = true;
+        memset(gCatCache, -1, sizeof(gCatCache));
         Serial.printf("[blocks] %d module types loaded from device\n", n);
     }
 }
@@ -921,18 +923,16 @@ void loadModuleTypes() {
 BlockCat resolveCat(int idx) {
     if (idx <= 0 || idx >= MAX_MODTYPES) return BC_NONE;
     if (gCatCache[idx] >= 0) return (BlockCat)gCatCache[idx];
-    BlockCat c = moduleCategory(idx);          // baked fallback (pre-seeded snapshot)
     String name = moduleName(idx);
-    if (name.length()) {
-        JsonDocument args; JsonArray a = args.to<JsonArray>(); a.add(name);
-        JsonDocument res;
-        if (hr.callMethod("/Evil/API/Blocks", "categoryOfBlock", args.as<JsonVariantConst>(), res)) {
-            BlockCat rc = genericCatFromDeviceString(res["methodReturnValue"] | "");
-            if (rc != BC_NONE) c = rc;
-        }
+    if (name.isEmpty()) return BC_NONE;            // block list not loaded -> unresolved (no guess)
+    JsonDocument args; JsonArray a = args.to<JsonArray>(); a.add(name);
+    JsonDocument res;
+    if (hr.callMethod("/Evil/API/Blocks", "categoryOfBlock", args.as<JsonVariantConst>(), res)) {
+        BlockCat c = genericCatFromDeviceString(res["methodReturnValue"] | "");
+        gCatCache[idx] = (int8_t)c;                // cache the device's answer (incl. uncategorized)
+        return c;
     }
-    gCatCache[idx] = (int8_t)c;
-    return c;
+    return BC_NONE;                                // transient failure: don't cache, retry next time
 }
 
 // Read one param's display spec (range + format) from object-meta. Falls back to
@@ -1063,7 +1063,15 @@ void resolveMembers() {
 // rig load and on rig edits (chain change), and after an Assign save.
 void resolveLayoutForRig() {
     gResolving = true;
-    loadModuleTypes();           // ensure the live block list is cached (once)
+    loadModuleTypes();           // live block list must be cached before we can resolve
+    if (!gBlocksOk) {
+        // No device block list — do NOT fabricate a layout from stale data. Leave
+        // the spinner up; the net loop keeps retrying loadModuleTypes and fires a
+        // fresh resolve once it succeeds. A persistent spinner + the connection
+        // bars make a real link/API problem visible instead of silently wrong.
+        Serial.println("[layout] blocks not loaded — deferring resolve");
+        return;
+    }
     JsonDocument chain;
     if (hr.getProperties("/Evil/Engine/Patch/Chain", chain)) buildPresent(chain);
     else { Serial.println("[layout] chain fetch FAIL"); gPresentCount = 0; }
@@ -1384,6 +1392,9 @@ void netTask(void*) {
             if (rigResolvePending && (millis() - rigResolveAtMs) > RIG_RESOLVE_DEBOUNCE_MS) {
                 rigResolvePending = false; doFetchRigList(); resolveLayoutForRig();   // resolve once the WS burst settles
             }
+            // If the live block list never loaded, keep retrying a resolve so a
+            // recovered link self-heals rather than sitting on a stale layout.
+            if (!gBlocksOk) { static uint32_t lastBlkTry = 0; if (millis() - lastBlkTry > 1500) { lastBlkTry = millis(); requestRigResolve(); } }
             if (rebindRequested) { rebindRequested = false; if (!tunerActive && !homeListActive) primeInitialValue(); }  // new control focused
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
             if (fetchRigListReq)     { fetchRigListReq = false; doFetchRigList(); }
@@ -1819,8 +1830,11 @@ void loop() {
 
     // ============================ HOME ============================
     // While the net task is resolving this rig's buttons, show a spinner and gate
-    // home input — the group/bindings are mid-write. Clears when it publishes.
+    // home input — the group/bindings are mid-write. (If the block list can't load
+    // this spins until the link recovers — a visible signal, not a stale layout.)
+    // Long-press still escapes to the Board Menu so the user isn't stuck.
     if (gResolving) {
+        if (longPress) { boardSel = 0; screen = SC_BOARD_MENU; Render::drawBoardMenu(canvas, boardSel); vTaskDelay(pdMS_TO_TICKS(10)); return; }
         static int spin = 0;
         Render::drawSpinner(canvas, "resolving", spin++);
         lastRenderedValue = -999999.0f;

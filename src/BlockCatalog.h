@@ -1,10 +1,18 @@
-// AUTO-GENERATED from HeadRush Prime (categoryOfBlock) — Prime fw 5.0.1.
-// Regenerate if the Prime firmware reorders ModuleTypes. See docs/UX_MODEL.md.
+// Generic block taxonomy + live-from-device block resolution.
+//
+// Deliberately holds NO baked per-module snapshot. The Prime's own ModuleTypes
+// (index -> name) and categoryOfBlock (name -> category) are the single source of
+// truth, fetched at runtime. A stale local copy would let resolution "succeed"
+// with the WRONG blocks after a firmware update reorders indices — silently —
+// which is worse than failing visibly (this is a controller for a device that
+// must be online anyway). What lives here is only our app's fixed taxonomy and
+// conventions, which are not device content and change only when WE change them.
 #pragma once
 #include <Arduino.h>
 
 // Generic block categories (the 20 device categories collapsed to the set the
-// knob-default generator reasons about).
+// knob-default generator reasons about). Order is load-bearing — values are
+// cached and compared elsewhere — so append, never reorder.
 enum BlockCat : uint8_t {
     BC_NONE = 0,
     BC_AMP = 1,
@@ -27,330 +35,31 @@ enum BlockCat : uint8_t {
     BC_COUNT
 };
 
-static constexpr int MODULE_TYPE_COUNT = 272;
-
-// ModuleType index -> generic category. Index matches Chain.ModuleTypeN.
-const uint8_t MODULE_CATEGORY[MODULE_TYPE_COUNT] PROGMEM = {
-     0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3,
-     3, 3, 3, 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-     5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6,
-     6, 6, 6, 6, 6, 6, 6, 9, 9, 9, 9, 9, 9,13,13, 7,
-     7,16,16,16,16, 8, 8, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-     5, 5, 5, 6, 6, 5, 5, 5, 5, 6, 6,11,11,10,10,10,
-    10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,10,
-    10,10,10,10,10,10,10, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-     8, 9, 9,11,11,11,11,11,11,11,11,12,12,12,12,10,
-    10,12,12,12,12,11,11,12,12,11,11, 8, 8,13,13,10,
-    10, 8, 8, 9, 9,12,12,12,12,12,12,13,13, 8, 8,10,
-    10,12,12,13,13,13,13, 9, 9, 9, 9,14,14,14,14, 8,
-     8, 8, 8, 7, 7, 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5,
-     5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 5, 5,10,10,10,
-    10,10,10, 8, 8,11,11,10,10, 8, 8, 5, 5,10,10,10,
-    10,10,10, 8, 8, 6, 6,16,16, 9, 9,15,15,15,15,15,
-    15, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,17,
-};
-
-// ModuleType index -> block object name (path = name with " "/"/" -> "_").
-const char* const MODULE_NAME[MODULE_TYPE_COUNT] PROGMEM = {
-    "Empty Slot",
-    "Amp",
-    "Amp 2",
-    "ReValver Amp",
-    "ReValver Amp 2",
-    "ReValver Cab",
-    "ReValver Cab 2",
-    "Cab",
-    "Cab 2",
-    "IR",
-    "IR 2",
-    "IR (1024)",
-    "IR (1024) 2",
-    "Amp Clone",
-    "Amp Clone 2",
-    "Pedal Clone",
-    "Pedal Clone 2",
-    "SuperClone",
-    "SuperClone 2",
-    "Gray Comp",
-    "Gray Comp 2",
-    "DynIII Comp",
-    "DynIII Comp 2",
-    "Green JRC-OD",
-    "Green JRC-OD 2",
-    "White Boost",
-    "White Boost 2",
-    "Jimmy OD",
-    "Jimmy OD 2",
-    "Palace OD",
-    "Palace OD 2",
-    "Tri Fuzz",
-    "Tri Fuzz 2",
-    "B Dist 7000",
-    "B Dist 7000 2",
-    "Glorious Drive",
-    "Glorious Drive 2",
-    "B2 Drive",
-    "B2 Drive 2",
-    "D250 Drive",
-    "D250 Drive 2",
-    "Round Fuzz",
-    "Round Fuzz 2",
-    "K Drive",
-    "K Drive 2",
-    "Black Op",
-    "Black Op 2",
-    "Bass EQ",
-    "Bass EQ 2",
-    "Graphic EQ",
-    "Graphic EQ 2",
-    "Ten Freq EQ",
-    "Ten Freq EQ 2",
-    "Para EQ",
-    "Para EQ 2",
-    "AIR Reverb",
-    "AIR Reverb 2",
-    "Eleven Reverb",
-    "Eleven Reverb 2",
-    "Spring Reverb",
-    "Spring Reverb 2",
-    "Volume",
-    "Volume 2",
-    "Side Comp",
-    "Side Comp 2",
-    "Noise Filter",
-    "Noise Filter 2",
-    "Gate",
-    "Gate 2",
-    "Stereo Doubler",
-    "Stereo Doubler 2",
-    "Oct Fuzz",
-    "Oct Fuzz 2",
-    "Anxiety OD",
-    "Anxiety OD 2",
-    "Anxiety OD V2",
-    "Anxiety OD V2 2",
-    "D1 Dist",
-    "D1 Dist 2",
-    "S1 Drive",
-    "S1 Drive 2",
-    "MX Dist",
-    "MX Dist 2",
-    "Acoust Sim",
-    "Acoust Sim 2",
-    "DC Distort",
-    "DC Distort 2",
-    "8-Bit Crush",
-    "8-Bit Crush 2",
-    "Acoustic Pre",
-    "Acoustic Pre 2",
-    "AIR Filter",
-    "AIR Filter 2",
-    "Chorus",
-    "Chorus 2",
-    "Multi Chorus",
-    "Multi Chorus 2",
-    "Dim Chorus",
-    "Dim Chorus 2",
-    "Flanger",
-    "Flanger 2",
-    "AIR Flanger",
-    "AIR Flanger 2",
-    "Vibe Phaser",
-    "Vibe Phaser 2",
-    "Orange Phaser",
-    "Orange Phaser 2",
-    "Tron Phaser",
-    "Tron Phaser 2",
-    "Stone Phaser",
-    "Stone Phaser 2",
-    "Vibrato",
-    "Vibrato 2",
-    "Rotary",
-    "Rotary 2",
-    "Tremolo",
-    "Tremolo 2",
-    "AIR Vibrato",
-    "AIR Vibrato 2",
-    "Tape Echo",
-    "Tape Echo 2",
-    "Time Warp",
-    "Time Warp 2",
-    "Reverse Delay",
-    "Reverse Delay 2",
-    "BBD Delay",
-    "BBD Delay 2",
-    "Dyn Delay",
-    "Dyn Delay 2",
-    "Spring Guru",
-    "Spring Guru 2",
-    "Shine Wah",
-    "Shine Wah 2",
-    "Black Wah",
-    "Black Wah 2",
-    "More Wah",
-    "More Wah 2",
-    "White Bass Wah",
-    "White Bass Wah 2",
-    "Wham",
-    "Wham 2",
-    "Harm",
-    "Harm 2",
-    "Panner",
-    "Panner 2",
-    "Octaves",
-    "Octaves 2",
-    "Octaves Up",
-    "Octaves Up 2",
-    "Tron Filter",
-    "Tron Filter 2",
-    "Smart Harm",
-    "Smart Harm 2",
-    "Env Filter",
-    "Env Filter 2",
-    "Reso Delay",
-    "Reso Delay 2",
-    "Auto Swell",
-    "Auto Swell 2",
-    "Ring Mod",
-    "Ring Mod 2",
-    "AIR Delay",
-    "AIR Delay 2",
-    "Shimmer",
-    "Shimmer 2",
-    "Chord Wham",
-    "Chord Wham 2",
-    "Drop Tune",
-    "Drop Tune 2",
-    "Up Tune",
-    "Up Tune 2",
-    "Feedback",
-    "Feedback 2",
-    "Pitch Delay",
-    "Pitch Delay 2",
-    "Detune",
-    "Detune 2",
-    "12 String",
-    "12 String 2",
-    "Sustain",
-    "Sustain 2",
-    "Hold",
-    "Hold 2",
-    "Ambi Verb",
-    "Ambi Verb 2",
-    "Party Verb",
-    "Party Verb 2",
-    "Kill Seq",
-    "Kill Seq 2",
-    "Splicer",
-    "Splicer 2",
-    "Multi Delay",
-    "Multi Delay 2",
-    "Grain Delay",
-    "Grain Delay 2",
-    "Pressor",
-    "Pressor 2",
-    "Slammer",
-    "Slammer 2",
-    "Budda Comp",
-    "Budda Comp 2",
-    "Slab O Meat",
-    "Slab O Meat 2",
-    "Black Death",
-    "Black Death 2",
-    "Grinder Bass OD",
-    "Grinder Bass OD 2",
-    "Budda OM OD",
-    "Budda OM OD 2",
-    "Greener",
-    "Greener 2",
-    "Greener Lite",
-    "Greener Lite 2",
-    "Sher'ff",
-    "Sher'ff 2",
-    "Promise EQ",
-    "Promise EQ 2",
-    "G EQ",
-    "G EQ 2",
-    "Treble Booster",
-    "Treble Booster 2",
-    "Analog Flanger",
-    "Analog Flanger 2",
-    "Digital Flanger",
-    "Digital Flanger 2",
-    "Square-Phase",
-    "Square-Phase 2",
-    "Again Delay",
-    "Again Delay 2",
-    "Bud Wah",
-    "Bud Wah 2",
-    "Budda Karma Chorus",
-    "Budda Karma Chorus 2",
-    "Budda Samsara Delay",
-    "Budda Samsara Delay 2",
-    "Budda ZenMan",
-    "Budda ZenMan 2",
-    "C2 Bass Chorus",
-    "C2 Bass Chorus 2",
-    "Tube Tremolo",
-    "Tube Tremolo 2",
-    "C2 Chorus",
-    "C2 Chorus 2",
-    "M104 Analog Delay",
-    "M104 Analog Delay 2",
-    "Auto Q 8 Band EQ",
-    "Auto Q 8 Band EQ 2",
-    "Kaften Gate",
-    "Kaften Gate 2",
-    "C-Verb",
-    "C-Verb 2",
-    "Hybrid",
-    "Hybrid 2",
-    "DB-33",
-    "DB-33 2",
-    "Electric",
-    "Electric 2",
-    "Vocal Harmony",
-    "Vocal Harmony 2",
-    "Auto-Tune",
-    "Auto-Tune 2",
-    "Vocal Doubler",
-    "Vocal Doubler 2",
-    "Vocal Stutter",
-    "Vocal Stutter 2",
-    "Vocal Distortion",
-    "Vocal Distortion 2",
-    "Vocoder",
-    "Vocoder 2",
-    "De-Esser",
-    "De-Esser 2",
-    "FX-Loop",
-};
-
-// Runtime ModuleTypes cache, fetched live from the Prime (/Evil/API/Blocks) and
-// preferred over the baked snapshot below — so a Prime firmware update that
-// reorders/adds module types resolves correctly without regenerating this file.
-// Allocated in PSRAM + filled by the net task (loadModuleTypes); null until then,
-// when the baked table is the fallback. Single translation unit (main.cpp).
-const int MAX_MODTYPES = 320;          // room above the current 272 for firmware additions
-char (*gModNameRT)[32] = nullptr;      // [idx] -> name, or null if not yet loaded
+// Live ModuleTypes cache, fetched from the Prime (/Evil/API/Blocks) and filled by
+// the net task (loadModuleTypes). Allocated in PSRAM; null/0 until loaded, and a
+// module is simply unresolved until then — no stale fallback. Single TU (main.cpp).
+const int MAX_MODTYPES = 320;          // room above the current ~272 for firmware additions
+char (*gModNameRT)[32] = nullptr;      // [idx] -> name
 int  gModCountRT = 0;
 
-inline BlockCat moduleCategory(int idx) {   // baked fallback only; runtime path is resolveCat()
-    if (idx < 0 || idx >= MODULE_TYPE_COUNT) return BC_NONE;
-    return (BlockCat)pgm_read_byte(&MODULE_CATEGORY[idx]);
+inline String moduleName(int idx) {
+    if (gModNameRT && idx >= 0 && idx < gModCountRT && gModNameRT[idx][0]) return String(gModNameRT[idx]);
+    return String();                   // not loaded -> unresolved (caller handles; never guesses)
 }
 
-inline String moduleName(int idx) {
-    if (gModNameRT && idx >= 0 && idx < gModCountRT && gModNameRT[idx][0])
-        return String(gModNameRT[idx]);                 // live from the device
-    if (idx < 0 || idx >= MODULE_TYPE_COUNT) return String();
-    return String((const char*)pgm_read_ptr(&MODULE_NAME[idx]));   // baked fallback
+// Build "/Evil/Engine/Patch/<name>" for a module index (spaces/slash -> _).
+inline String moduleBlockPath(int idx) {
+    if (idx <= 0) return String();
+    String n = moduleName(idx);
+    if (n.isEmpty() || n == "Empty Slot") return String();
+    for (size_t i = 0; i < n.length(); ++i) { char c = n[i]; if (c == ' ' || c == '/') n[i] = '_'; }
+    return String("/Evil/Engine/Patch/") + n;
 }
 
 // Map the Prime's own display category string (from categoryOfBlock /
-// BlockSelectorCategoriesForDisplay) to a generic BlockCat. Stable across device
-// content downloads (only firmware updates add categories), so this is the
-// runtime-authoritative path: a newly added block still reports one of these.
+// BlockSelectorCategoriesForDisplay) to a generic BlockCat. This is a translation
+// of the device's LIVE output, not a snapshot — it only needs editing if HeadRush
+// adds a brand-new category (which would warrant a code change regardless).
 inline BlockCat genericCatFromDeviceString(const char* s) {
     if (!s || !s[0]) return BC_NONE;
     struct M { const char* k; BlockCat c; };
@@ -366,23 +75,14 @@ inline BlockCat genericCatFromDeviceString(const char* s) {
     return BC_NONE;
 }
 
-// Build "/Evil/Engine/Patch/<name>" for a module index (spaces/slash -> _).
-inline String moduleBlockPath(int idx) {
-    if (idx <= 0) return String();
-    String n = moduleName(idx);
-    if (n.isEmpty() || n == "Empty Slot") return String();
-    for (size_t i = 0; i < n.length(); ++i) { char c = n[i]; if (c == ' ' || c == '/') n[i] = '_'; }
-    return String("/Evil/Engine/Patch/") + n;
-}
-
 // --- Per-category knob default ("the primary param to ride") ----------------
 //
 // For a generic category we expose ONE primary parameter on the dial. Blocks in
 // a category aren't identical, so each category carries an ordered list of
 // candidate prop names; the resolver picks the first the actual block exposes.
-// Almost every "amount" param is normalized 0..1 on the wire and shown 0..100%
-// (verified against object-meta: Drive/Mix/GainA/Sustain all min=0 max=100
-// "%.0f %%"), so one display spec covers them. See docs/UX_MODEL.md §6.
+// These are category CONVENTIONS (verified against real blocks), not per-device
+// snapshots — a new block in a category exposes one of these, so new/downloaded
+// models resolve without any edit here.
 
 struct CatBindSpec {
     BlockCat cat;
@@ -390,12 +90,6 @@ struct CatBindSpec {
     const char* candidates[5];    // ordered prop names; first present on the block wins
 };
 
-// Only the categories the default generator can put on a dial. Order within a
-// list is the preference; nullptr terminates. Candidate names are category
-// CONVENTIONS (verified against real blocks), not per-device — a new block in a
-// category exposes one of these, so downloads/new models resolve without a table
-// edit. Different blocks in one category genuinely differ (Gray Comp = Sustain,
-// Budda Comp = Compression; an OD = Drive, a fuzz = Fuzz), hence the lists.
 const CatBindSpec CAT_BIND[] = {
     { BC_DRIVE,  "DRIVE",  { "Drive", "Gain", "Fuzz", "Distortion", nullptr } },
     { BC_AMP,    "GAIN",   { "GainA", "Gain", "Master", nullptr, nullptr } },
@@ -419,4 +113,3 @@ const BlockCat GAIN_BUCKET[]  = { BC_DRIVE, BC_AMP, BC_COMP };
 const BlockCat SPACE_BUCKET[] = { BC_REVERB, BC_DELAY, BC_MOD, BC_FILTER, BC_PITCH };
 const int GAIN_BUCKET_COUNT  = sizeof(GAIN_BUCKET) / sizeof(GAIN_BUCKET[0]);
 const int SPACE_BUCKET_COUNT = sizeof(SPACE_BUCKET) / sizeof(SPACE_BUCKET[0]);
-
