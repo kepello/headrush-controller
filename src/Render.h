@@ -262,6 +262,20 @@ inline void drawLibraryIdle(LGFX_Sprite& gfx, const char* rigName, const char* s
     gfx.pushSprite(0, 0);
 }
 
+// Animated spinner shown while the net task is busy resolving a button (e.g. a
+// rig change introspecting the chain). `phase` increments each frame. UI only.
+inline void drawSpinner(LGFX_Sprite& gfx, const char* msg, int phase) {
+    gfx.fillScreen(COLOR_BG);
+    gfx.setTextDatum(middle_center);
+    float a0 = (float)((phase * 40) % 360);
+    gfx.fillArc(CX, CY - 6, 22, 30, 0, 360, COLOR_DIM);
+    gfx.fillArc(CX, CY - 6, 22, 30, a0, a0 + 70, COLOR_FALLBACK);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.drawString(msg, CX, CY + 44);
+    gfx.pushSprite(0, 0);
+}
+
 // Simple centered status (e.g. "loading...") for the list browser while the net
 // task fetches/loads over HTTP. UI task only.
 inline void drawListLoading(LGFX_Sprite& gfx, const char* msg) {
@@ -362,40 +376,50 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, int fwVersio
     drawSimpleMenu(gfx, "SETTINGS", labels, 4, sel, fwbuf);
 }
 
-// Assign-this-knob multi-select: a spinner over the catalog (dials then Tuner).
-// Selected members show their 1-based position in the group; `cursor` is the
-// highlighted item. sel[] holds the chosen view indices (param idx, or
-// paramCount for Tuner) in order. Hold confirms; click toggles.
-inline void drawAssignList(LGFX_Sprite& gfx, const ContinuousBinding* catalog, int paramCount, int cursor, const int* sel, int selLen) {
+// Multi-select picker used by the Assign screens (root list and the per-device
+// param drill-in). Rows are pre-built by the UI as big/small string pairs (big =
+// category or control, small = device name / "all params" / ""). Spinner layout:
+// current row big in the center with its subtitle, prev/next ghosted; the arc
+// dots carry the whole selection pattern (chosen = bright, cursor = ring). The
+// current row's big label turns accent-colored when it's in the group.
+inline void drawAssignList(LGFX_Sprite& gfx, const char* title,
+                           const char big[][16], const char small[][24],
+                           int count, int cursor, const bool* selected) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString("ASSIGN KNOB", CX, 32);
+    drawArcDots(gfx, count, cursor, selected);
 
-    int items = paramCount + 3;   // + Tuner + Setlist + Rig
-    auto label = [&](int i) -> const char* {
-        if (i < paramCount) return catalog[i].label;
-        if (i == paramCount) return "Tuner";
-        return (i == paramCount + 1) ? "Setlist" : "Rig";
-    };
-    auto orderOf = [&](int i) -> int { for (int k = 0; k < selLen; ++k) if (sel[k] == i) return k + 1; return 0; };
-    auto fill = [&](int i, char* buf) {
-        int o = orderOf(i);
-        if (o) snprintf(buf, 28, "[%d] %s", o, label(i));
-        else   snprintf(buf, 28, "[ ] %s", label(i));
-    };
-    int prev = (cursor - 1 + items) % items, next = (cursor + 1) % items;
-    char pb[28], cb[28], nb[28];
-    fill(prev, pb); fill(cursor, cb); fill(next, nb);
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.drawString(title, CX, CY - 58);
+
+    if (count <= 0) {
+        gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+        gfx.setFont(&fonts::FreeSansBold12pt7b);
+        gfx.drawString("(none)", CX, CY);
+        gfx.pushSprite(0, 0);
+        return;
+    }
+
+    int prev = (cursor - 1 + count) % count, next = (cursor + 1) % count;
     gfx.setFont(&fonts::FreeSansBold9pt7b);
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.drawString(pb, CX, CY - 40);
-    gfx.drawString(nb, CX, CY + 40);
-    gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
-    gfx.drawString(cb, CX, CY);
-    drawArcDots(gfx, items, cursor);
+    gfx.drawString(big[prev], CX, CY - 34);
+    gfx.drawString(big[next], CX, CY + 44);
+
+    bool hasSmall = small[cursor][0] != 0;
+    gfx.setTextColor(selected[cursor] ? COLOR_FALLBACK : COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(big[cursor]) > 8 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(big[cursor], CX, hasSmall ? CY - 6 : CY + 2);
+    if (hasSmall) {
+        gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+        gfx.setFont(&fonts::FreeSans9pt7b);
+        gfx.drawString(small[cursor], CX, CY + 18);
+    }
+
+    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
+    gfx.setFont(&fonts::FreeSansBold9pt7b);
+    gfx.drawString("hold = done", CX, 210);
     gfx.pushSprite(0, 0);
 }
 

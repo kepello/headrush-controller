@@ -402,7 +402,8 @@ void focusHomeMember(int i) {
 enum Screen {
     SC_HOME,            // the assigned knob: value group, tuner, or scroll-list
     SC_BOARD_MENU,      // hold from Home
-    SC_ASSIGN,          // multi-select the Home group
+    SC_ASSIGN,          // multi-select the Home group (rig-derived root list)
+    SC_ASSIGN_PARAMS,   // drill-in: pick params of one device
     SC_SETTINGS,        // device/global config menu
     SC_SET_ID,
     SC_WIFI, SC_WIFI_PW, SC_WIFI_CONNECTING
@@ -412,11 +413,38 @@ int boardSel = 0;       // cursor in the Board Menu
 int menuIndex = 0;      // cursor in the Settings menu
 int editIdValue = 1;
 
-// Assign (multi-select) scratch: an ordered selection of view indices being
-// built into the Home group. assignCursor spans 0..PARAM_COUNT (==Tuner).
-int assignCursor = 0;
-int assignSel[VIEW_COUNT];
-int assignSelLen = 0;
+// ---- Assign screens (rig-derived) ----
+// The group being edited, as members mirroring homeGroup + gHomeDesc.
+int      asgView[MAX_GROUP];
+HomeDesc asgDesc[MAX_GROUP];
+int      asgLen = 0;
+
+// Root rows, built from gPresent[] + globals + specials when Assign opens. Each
+// device contributes a primary row + an "all params" drill row.
+const int ASG_GLOBALS = 6;   // catalog 0..5: OUTPUT INPUT TEMPO WIDTH BASS TREBLE
+const int ASG_MAXROWS = MAX_PRESENT * 2 + ASG_GLOBALS + 3;
+enum AsgRowKind : uint8_t { ARK_DEV_PRIMARY, ARK_DEV_PARAMS, ARK_GLOBAL, ARK_SPECIAL };
+struct AsgRow { uint8_t kind; int16_t arg; };   // arg = present idx (devices) or view index
+AsgRow asgRows[ASG_MAXROWS];
+int    asgRowCount = 0;
+int    asgCursor = 0;
+char   asgBig[ASG_MAXROWS][16];
+char   asgSmall[ASG_MAXROWS][24];
+bool   asgSel[ASG_MAXROWS];
+
+// Param drill-in (one device). Fetched live from the Prime via the net task.
+struct DevParam { char label[16]; char prop[20]; };
+DevParam gDevParam[20];
+volatile int  gDevParamCount = 0;
+char          devParamsPath[48];        // UI -> net: which block to read params from
+volatile bool devParamsReq = false;     // UI -> net
+volatile bool devParamsDone = false;    // net -> UI
+int  asgParamsDev = -1;                  // present idx being drilled
+int  asgParamCursor = 0;
+char pBig[20][16], pSmall[20][24];
+bool pSel[20];
+
+// (Assign scratch + rig-derived rows are declared up by the Screen enum.)
 
 // On-device WiFi setup: the net task scans/connects, the UI picks + types.
 volatile bool scanRequested = false;  // UI -> net: run a scan
@@ -553,6 +581,147 @@ void generateDefaultHome() {
         default: homeGroup[0] = 0; homeGroup[1] = 1; homeGroupLen = 2; break;  // OUTPUT, INPUT
     }
     Serial.printf("[layout] default home for board %d role %d len %d\n", deviceId, role, homeGroupLen);
+}
+
+// ---- Assign screen helpers (UI task) ----
+bool asgMatchDevice(int m, const char* path, const char* prop) {
+    return asgView[m] == DYN_VIEW && asgDesc[m].kind == DK_DEVICE
+        && strcmp(asgDesc[m].path, path) == 0 && strcmp(asgDesc[m].prop, prop) == 0;
+}
+int asgFindDevice(const char* path, const char* prop) {
+    for (int m = 0; m < asgLen; ++m) if (asgMatchDevice(m, path, prop)) return m;
+    return -1;
+}
+int asgFindView(int view) {
+    for (int m = 0; m < asgLen; ++m) if (asgView[m] == view && asgDesc[m].kind == DK_NONE) return m;
+    return -1;
+}
+void asgRemoveAt(int m) {
+    for (int i = m; i < asgLen - 1; ++i) { asgView[i] = asgView[i + 1]; asgDesc[i] = asgDesc[i + 1]; }
+    asgLen--;
+}
+void asgToggleDevice(uint8_t cat, const char* path, const char* prop) {
+    int m = asgFindDevice(path, prop);
+    if (m >= 0) { asgRemoveAt(m); return; }
+    if (asgLen >= MAX_GROUP) return;
+    asgView[asgLen] = DYN_VIEW;
+    HomeDesc& d = asgDesc[asgLen];
+    d.kind = DK_DEVICE; d.cat = cat;
+    strncpy(d.path, path, sizeof(d.path)); d.path[sizeof(d.path) - 1] = 0;
+    strncpy(d.prop, prop, sizeof(d.prop)); d.prop[sizeof(d.prop) - 1] = 0;
+    asgLen++;
+}
+void asgToggleView(int view) {
+    int m = asgFindView(view);
+    if (m >= 0) { asgRemoveAt(m); return; }
+    if (asgLen >= MAX_GROUP) return;
+    asgView[asgLen] = view;
+    asgDesc[asgLen].kind = DK_NONE; asgDesc[asgLen].cat = 0;
+    asgDesc[asgLen].path[0] = 0; asgDesc[asgLen].prop[0] = 0;
+    asgLen++;
+}
+
+// Build the rig-derived root rows (devices in chain order: primary + "more…";
+// then globals; then Tuner/Setlist/Rig) + their display strings.
+void buildAssignRows() {
+    asgRowCount = 0;
+    int pc = gPresentCount; if (pc > MAX_PRESENT) pc = MAX_PRESENT;
+    for (int p = 0; p < pc && asgRowCount < ASG_MAXROWS - 2; ++p) {
+        asgRows[asgRowCount] = { ARK_DEV_PRIMARY, (int16_t)p };
+        strncpy(asgBig[asgRowCount], gPresent[p].label, 15);  asgBig[asgRowCount][15] = 0;
+        strncpy(asgSmall[asgRowCount], gPresent[p].device, 23); asgSmall[asgRowCount][23] = 0;
+        asgRowCount++;
+        asgRows[asgRowCount] = { ARK_DEV_PARAMS, (int16_t)p };
+        strncpy(asgBig[asgRowCount], "more...", 15); asgBig[asgRowCount][15] = 0;
+        strncpy(asgSmall[asgRowCount], gPresent[p].device, 23); asgSmall[asgRowCount][23] = 0;
+        asgRowCount++;
+    }
+    for (int g = 0; g < ASG_GLOBALS && asgRowCount < ASG_MAXROWS; ++g) {
+        asgRows[asgRowCount] = { ARK_GLOBAL, (int16_t)g };
+        strncpy(asgBig[asgRowCount], PARAM_CATALOG[g].label, 15); asgBig[asgRowCount][15] = 0;
+        asgSmall[asgRowCount][0] = 0;
+        asgRowCount++;
+    }
+    const int  sp[3]  = { TUNER_VIEW, SETLIST_VIEW, RIG_VIEW };
+    const char* spn[3] = { "TUNER", "SETLIST", "RIG" };
+    for (int s = 0; s < 3 && asgRowCount < ASG_MAXROWS; ++s) {
+        asgRows[asgRowCount] = { ARK_SPECIAL, (int16_t)sp[s] };
+        strncpy(asgBig[asgRowCount], spn[s], 15); asgBig[asgRowCount][15] = 0;
+        asgSmall[asgRowCount][0] = 0;
+        asgRowCount++;
+    }
+}
+
+// Recompute which root rows are in the scratch group (for the dot overlay).
+void computeAsgSelected() {
+    for (int r = 0; r < asgRowCount; ++r) {
+        const AsgRow& row = asgRows[r];
+        bool sel = false;
+        if (row.kind == ARK_DEV_PRIMARY) {
+            PresentDev& pd = gPresent[row.arg];
+            sel = asgFindDevice(pd.path, pd.prop) >= 0;
+        } else if (row.kind == ARK_DEV_PARAMS) {
+            PresentDev& pd = gPresent[row.arg];
+            for (int m = 0; m < asgLen && !sel; ++m)
+                if (asgView[m] == DYN_VIEW && asgDesc[m].kind == DK_DEVICE
+                    && strcmp(asgDesc[m].path, pd.path) == 0 && strcmp(asgDesc[m].prop, pd.prop) != 0) sel = true;
+        } else {
+            sel = asgFindView(row.arg) >= 0;
+        }
+        asgSel[r] = sel;
+    }
+}
+
+void seedAssignFromHome() {
+    asgLen = homeGroupLen > MAX_GROUP ? MAX_GROUP : homeGroupLen;
+    for (int i = 0; i < asgLen; ++i) { asgView[i] = homeGroup[i]; asgDesc[i] = gHomeDesc[i]; }
+    asgCursor = 0;
+}
+
+// Copy the scratch group into the live group, persist it, and let the net task
+// re-resolve + republish (a spinner shows during the brief delay).
+void commitAssign() {
+    int n = asgLen < 1 ? 1 : asgLen;
+    homeGroupLen = n;
+    for (int i = 0; i < n; ++i) { homeGroup[i] = asgView[i]; gHomeDesc[i] = asgDesc[i]; }
+    if (asgLen < 1) { homeGroup[0] = 0; memset(&gHomeDesc[0], 0, sizeof(HomeDesc)); }
+    homeFocus = 0;
+    char rigId[40];
+    portENTER_CRITICAL(&stateMux);
+    strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
+    portEXIT_CRITICAL(&stateMux);
+    saveHomeForRig(rigId);
+    rigChangedReq = true;
+}
+
+void renderAssignRoot() {
+    computeAsgSelected();
+    Render::drawAssignList(canvas, "ASSIGN", asgBig, asgSmall, asgRowCount, asgCursor, asgSel);
+}
+
+// Build the param-list display rows for the drilled device + mark which are in
+// the group. Returns nothing; reads gDevParam (filled by the net task).
+void renderAssignParams() {
+    if (asgParamsDev < 0 || asgParamsDev >= gPresentCount) return;
+    PresentDev& pd = gPresent[asgParamsDev];
+    int n = gDevParamCount; if (n > 20) n = 20;
+    for (int i = 0; i < n; ++i) {
+        strncpy(pBig[i], gDevParam[i].label, 15); pBig[i][15] = 0;
+        pSmall[i][0] = 0;
+        pSel[i] = asgFindDevice(pd.path, gDevParam[i].prop) >= 0;
+    }
+    Render::drawAssignList(canvas, pd.device, pBig, pSmall, n, asgParamCursor, pSel);
+}
+
+void enterAssignParams(int p) {
+    asgParamsDev = p;
+    asgParamCursor = 0;
+    strncpy(devParamsPath, gPresent[p].path, sizeof(devParamsPath)); devParamsPath[sizeof(devParamsPath) - 1] = 0;
+    gDevParamCount = 0;
+    devParamsDone = false;
+    devParamsReq = true;                 // net fetches the device's params
+    screen = SC_ASSIGN_PARAMS;
+    Render::drawListLoading(canvas, "loading...");
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -869,6 +1038,29 @@ void resolveLayoutForRig() {
     layoutDirty = true;   // UI: a new resolved group is ready
 }
 
+// Fetch one device's named params for the Assign drill-in (net task). The block's
+// `order`/`labels` arrays are the Prime's own knob layout; we keep the numeric,
+// labeled params (skipping routing/switches) so the user picks from real knobs.
+void doFetchDevParams() {
+    gDevParamCount = 0;
+    JsonDocument doc;
+    if (hr.getProperties(devParamsPath, doc)) {
+        JsonArrayConst order  = doc["order"].as<JsonArrayConst>();
+        JsonArrayConst labels = doc["labels"].as<JsonArrayConst>();
+        for (size_t k = 0; k < order.size() && gDevParamCount < 20; ++k) {
+            const char* prop = order[k] | "";
+            const char* lab  = (k < labels.size()) ? (labels[k] | "") : "";
+            if (!prop[0] || !lab[0]) continue;          // unnamed / hidden knob
+            if (!doc[prop].is<float>()) continue;        // only numeric, ridable params
+            int n = gDevParamCount;
+            strncpy(gDevParam[n].label, lab, sizeof(gDevParam[n].label) - 1); gDevParam[n].label[sizeof(gDevParam[n].label) - 1] = 0;
+            strncpy(gDevParam[n].prop, prop, sizeof(gDevParam[n].prop) - 1);  gDevParam[n].prop[sizeof(gDevParam[n].prop) - 1] = 0;
+            gDevParamCount = n + 1;
+        }
+    }
+    devParamsDone = true;
+}
+
 // Load the setlist whose id is in libSelSetlistId.
 void doLoadSetlist() {
     JsonDocument args;
@@ -1151,6 +1343,7 @@ void netTask(void*) {
             if (fetchRigListReq)     { fetchRigListReq = false; doFetchRigList(); }
             if (loadSetlistReq)      { loadSetlistReq = false; doLoadSetlist(); }
             if (libLoadRigReq)       { libLoadRigReq = false; doLibLoadRig(); }
+            if (devParamsReq)        { devParamsReq = false; doFetchDevParams(); }
             if (bypassToggleReq) {   // Phase 1 stub — Phase 2 toggles the block's enable on the Prime
                 bypassToggleReq = false;
                 Serial.printf("[bypass] toggle requested for %s (stub — not yet wired)\n", activeBinding->label);
@@ -1330,11 +1523,10 @@ void loop() {
         }
         if (clicked) {
             if (boardSel == 0) {            // Assign this knob — seed from current group
-                assignSelLen = homeGroupLen;
-                for (int i = 0; i < homeGroupLen; ++i) assignSel[i] = homeGroup[i];
-                assignCursor = 0;
+                seedAssignFromHome();
+                buildAssignRows();
                 screen = SC_ASSIGN;
-                Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+                renderAssignRoot();
             } else {                        // Settings
                 menuIndex = 0;
                 screen = SC_SETTINGS;
@@ -1351,49 +1543,74 @@ void loop() {
         return;
     }
 
-    // --- Assign this knob (multi-select -> ordered Home group) ---
+    // --- Assign this knob: rig-derived root list (devices + globals + special) ---
     if (screen == SC_ASSIGN) {
-        const int items = PARAM_COUNT + 3;   // dials, Tuner, Setlist, Rig
-        int cursorView = (assignCursor < PARAM_COUNT) ? assignCursor
-                        : (assignCursor == PARAM_COUNT) ? TUNER_VIEW
-                        : (assignCursor == PARAM_COUNT + 1) ? SETLIST_VIEW : RIG_VIEW;
-        if (longPress) {                      // confirm the group, back to Home
-            if (assignSelLen > 0) {
-                int n = assignSelLen > MAX_GROUP ? MAX_GROUP : assignSelLen;
-                homeGroupLen = n;
-                for (int i = 0; i < n; ++i) {  // legacy global/special picks: no descriptor
-                    homeGroup[i] = assignSel[i];
-                    gHomeDesc[i].kind = DK_NONE; gHomeDesc[i].cat = 0;
-                    gHomeDesc[i].path[0] = 0; gHomeDesc[i].prop[0] = 0;
-                }
-                char rigId[40];              // persist this layout for the loaded rig
-                portENTER_CRITICAL(&stateMux);
-                strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
-                portEXIT_CRITICAL(&stateMux);
-                saveHomeForRig(rigId);
-                rigChangedReq = true;        // net reloads + resolves + republishes
-            }
+        if (asgRowCount <= 0) {   // sparse / not yet resolved — nothing to pick
+            if (longPress) { screen = SC_HOME; focusHomeMember(homeFocus); lastRenderedValue = -999999.0f; vTaskDelay(pdMS_TO_TICKS(5)); return; }
+            vTaskDelay(pdMS_TO_TICKS(10)); return;
+        }
+        if (longPress) {                      // commit the group, back to Home
+            commitAssign();
             screen = SC_HOME;
             lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
-        if (clicked) {                        // toggle the cursor control in/out of the group
-            int at = -1;
-            for (int i = 0; i < assignSelLen; ++i) if (assignSel[i] == cursorView) { at = i; break; }
-            if (at >= 0) {                    // remove (preserve order)
-                for (int i = at; i < assignSelLen - 1; ++i) assignSel[i] = assignSel[i + 1];
-                assignSelLen--;
-            } else if (assignSelLen < MAX_GROUP) {
-                assignSel[assignSelLen++] = cursorView;   // append in selection order
+        if (clicked) {
+            const AsgRow& row = asgRows[asgCursor];
+            if (row.kind == ARK_DEV_PRIMARY) {
+                PresentDev& pd = gPresent[row.arg];
+                asgToggleDevice(pd.cat, pd.path, pd.prop);
+            } else if (row.kind == ARK_DEV_PARAMS) {
+                enterAssignParams(row.arg);   // drill in
+                vTaskDelay(pdMS_TO_TICKS(5));
+                return;
+            } else {                          // GLOBAL / SPECIAL
+                asgToggleView(row.arg);
             }
-            Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+            renderAssignRoot();
             vTaskDelay(pdMS_TO_TICKS(5));
             return;
         }
         if (edelta != 0) {
-            assignCursor = (int)(((assignCursor + edelta) % items + items) % items);
-            Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
+            asgCursor = (int)(((asgCursor + edelta) % asgRowCount + asgRowCount) % asgRowCount);
+            renderAssignRoot();
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return;
+    }
+
+    // --- Assign drill-in: pick params of one device (multi-select) ---
+    if (screen == SC_ASSIGN_PARAMS) {
+        if (!devParamsDone) {                 // waiting on the net fetch
+            vTaskDelay(pdMS_TO_TICKS(20));
+            return;
+        }
+        static bool paramsShown = false;
+        if (longPress) {                      // back to the root list
+            paramsShown = false;
+            screen = SC_ASSIGN;
+            renderAssignRoot();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (gDevParamCount <= 0) {            // no ridable params — show briefly, wait for back
+            if (!paramsShown) { Render::drawListLoading(canvas, "no params"); paramsShown = true; }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            return;
+        }
+        if (!paramsShown) { renderAssignParams(); paramsShown = true; }
+        if (clicked) {
+            PresentDev& pd = gPresent[asgParamsDev];
+            asgToggleDevice(pd.cat, pd.path, gDevParam[asgParamCursor].prop);
+            renderAssignParams();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            return;
+        }
+        if (edelta != 0) {
+            int n = gDevParamCount;
+            asgParamCursor = (int)(((asgParamCursor + edelta) % n + n) % n);
+            renderAssignParams();
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
@@ -1545,6 +1762,15 @@ void loop() {
     }
 
     // ============================ HOME ============================
+    // While the net task is resolving this rig's buttons, show a spinner and gate
+    // home input — the group/bindings are mid-write. Clears when it publishes.
+    if (gResolving) {
+        static int spin = 0;
+        Render::drawSpinner(canvas, "resolving", spin++);
+        lastRenderedValue = -999999.0f;
+        vTaskDelay(pdMS_TO_TICKS(60));
+        return;
+    }
     // hold opens the Board Menu.
     if (longPress) {
         boardSel = 0; screen = SC_BOARD_MENU;
