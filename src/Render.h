@@ -376,14 +376,12 @@ inline void drawConfigMenu(LGFX_Sprite& gfx, int sel, int deviceId, int fwVersio
     drawSimpleMenu(gfx, "SETTINGS", labels, 4, sel, fwbuf);
 }
 
-// Multi-select picker used by the Assign screens (root list and the per-device
-// param drill-in). Rows are pre-built by the UI as big/small string pairs (big =
-// category or control, small = device name / "all params" / ""). Spinner layout:
-// current row big in the center with its subtitle, prev/next ghosted; the arc
-// dots carry the whole selection pattern (chosen = bright, cursor = ring). The
-// current row's big label turns accent-colored when it's in the group.
-inline void drawAssignList(LGFX_Sprite& gfx, const char* title,
-                           const char big[][16], const char small[][24],
+// Multi-select picker used by the Assign screens (root list + param drill-in).
+// Same single-item paradigm as every other list: title, the current row big in
+// the center with its subtitle (big = category/control, small = device name/""),
+// position + whole selection via the arc dots (chosen = bright, cursor = ring).
+// The current label turns accent-colored when it's in the group. No instructions.
+inline void drawAssignList(LGFX_Sprite& gfx, const char* title, const char* big, const char* small,
                            int count, int cursor, const bool* selected) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
@@ -391,35 +389,26 @@ inline void drawAssignList(LGFX_Sprite& gfx, const char* title,
 
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.drawString(title, CX, CY - 58);
+    gfx.drawString(title, CX, CY - 50);
 
-    if (count <= 0) {
+    if (count <= 0 || !big) {
         gfx.setTextColor(COLOR_VALUE, COLOR_BG);
         gfx.setFont(&fonts::FreeSansBold12pt7b);
-        gfx.drawString("(none)", CX, CY);
+        gfx.drawString("(none)", CX, CY + 4);
         gfx.pushSprite(0, 0);
         return;
     }
 
-    int prev = (cursor - 1 + count) % count, next = (cursor + 1) % count;
-    gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.drawString(big[prev], CX, CY - 34);
-    gfx.drawString(big[next], CX, CY + 44);
-
-    bool hasSmall = small[cursor][0] != 0;
-    gfx.setTextColor(selected[cursor] ? COLOR_FALLBACK : COLOR_VALUE, COLOR_BG);
-    gfx.setFont(strlen(big[cursor]) > 8 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
-    gfx.drawString(big[cursor], CX, hasSmall ? CY - 6 : CY + 2);
+    bool hasSmall = small && small[0] != 0;
+    bool sel = selected && selected[cursor];
+    gfx.setTextColor(sel ? COLOR_FALLBACK : COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(big) > 8 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(big, CX, hasSmall ? CY : CY + 6);
     if (hasSmall) {
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
         gfx.setFont(&fonts::FreeSans9pt7b);
-        gfx.drawString(small[cursor], CX, CY + 18);
+        gfx.drawString(small, CX, CY + 24);
     }
-
-    gfx.setTextColor(COLOR_LABEL, COLOR_BG);
-    gfx.setFont(&fonts::FreeSansBold9pt7b);
-    gfx.drawString("hold = done", CX, 210);
     gfx.pushSprite(0, 0);
 }
 

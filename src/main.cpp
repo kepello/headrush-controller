@@ -223,12 +223,15 @@ const char* LIB_SETLISTS_PATH = "/Evil/API/Setlists";
 const char* LIB_RIGS_PATH     = "/Evil/API/Rigs";
 const int LIB_MAX_SETLISTS = 16;
 const int LIB_MAX_RIGS = 48;
-char libSetlistNames[LIB_MAX_SETLISTS][40];
-char libSetlistIds[LIB_MAX_SETLISTS][40];
+// These library-browser name/id tables (~7KB) live in PSRAM, allocated in setup,
+// to keep internal SRAM free for the OTA TLS handshake (which needs a large
+// contiguous block). Pointer-to-array, so `libRigNames[i]` indexing is unchanged.
+char (*libSetlistNames)[40];
+char (*libSetlistIds)[40];
 int  libSetlistCount = 0;
-char libRigNames[LIB_MAX_RIGS][40];
-char libRigIds[LIB_MAX_RIGS][40];
-char libRigSrIds[LIB_MAX_RIGS][40];          // setlist-id context per rig (loadRig needs it)
+char (*libRigNames)[40];
+char (*libRigIds)[40];
+char (*libRigSrIds)[40];                     // setlist-id context per rig (loadRig needs it)
 int  libRigCount = 0;
 char libSelSetlistId[40] = "";
 char libSelRigId[40] = "";
@@ -265,7 +268,13 @@ volatile float sharedValue = 0.0f;            // in display units (e.g. dB)
 volatile float pendingWriteValue = 0;
 volatile bool  pendingWriteValid = false;
 volatile uint32_t lastLocalChangeMs = 0;
-volatile bool  rigChangedReq = false;   // WS push said the rig changed; net re-resolves the layout
+// Rig-change resolve trigger, debounced: a rig load/edit emits a BURST of WS
+// frames (PresetName + every chain slot), so instead of resolving on each we
+// push a timestamp and the net loop resolves once the burst goes quiet.
+volatile bool     rigResolvePending = false;
+volatile uint32_t rigResolveAtMs = 0;
+constexpr uint32_t RIG_RESOLVE_DEBOUNCE_MS = 500;
+inline void requestRigResolve() { rigResolveAtMs = millis(); rigResolvePending = true; }
 
 // OTA state. Written by ArduinoOTA callbacks on the net task, read by the UI
 // task to render the progress screen. Plain volatile is sufficient — these are
@@ -428,9 +437,7 @@ struct AsgRow { uint8_t kind; int16_t arg; };   // arg = present idx (devices) o
 AsgRow asgRows[ASG_MAXROWS];
 int    asgRowCount = 0;
 int    asgCursor = 0;
-char   asgBig[ASG_MAXROWS][16];
-char   asgSmall[ASG_MAXROWS][24];
-bool   asgSel[ASG_MAXROWS];
+bool   asgSel[ASG_MAXROWS];              // per-row selection (for the dot overlay)
 
 // Param drill-in (one device). Fetched live from the Prime via the net task.
 struct DevParam { char label[16]; char prop[20]; };
@@ -441,8 +448,7 @@ volatile bool devParamsReq = false;     // UI -> net
 volatile bool devParamsDone = false;    // net -> UI
 int  asgParamsDev = -1;                  // present idx being drilled
 int  asgParamCursor = 0;
-char pBig[20][16], pSmall[20][24];
-bool pSel[20];
+bool pSel[20];                           // per-param selection
 
 // (Assign scratch + rig-derived rows are declared up by the Screen enum.)
 
@@ -622,33 +628,38 @@ void asgToggleView(int view) {
 }
 
 // Build the rig-derived root rows (devices in chain order: primary + "more…";
-// then globals; then Tuner/Setlist/Rig) + their display strings.
+// then globals; then Tuner/Setlist/Rig). Labels are computed on the fly when
+// rendering (only the current row is shown), so no per-row string storage.
 void buildAssignRows() {
     asgRowCount = 0;
     int pc = gPresentCount; if (pc > MAX_PRESENT) pc = MAX_PRESENT;
     for (int p = 0; p < pc && asgRowCount < ASG_MAXROWS - 2; ++p) {
-        asgRows[asgRowCount] = { ARK_DEV_PRIMARY, (int16_t)p };
-        strncpy(asgBig[asgRowCount], gPresent[p].label, 15);  asgBig[asgRowCount][15] = 0;
-        strncpy(asgSmall[asgRowCount], gPresent[p].device, 23); asgSmall[asgRowCount][23] = 0;
-        asgRowCount++;
-        asgRows[asgRowCount] = { ARK_DEV_PARAMS, (int16_t)p };
-        strncpy(asgBig[asgRowCount], "more...", 15); asgBig[asgRowCount][15] = 0;
-        strncpy(asgSmall[asgRowCount], gPresent[p].device, 23); asgSmall[asgRowCount][23] = 0;
-        asgRowCount++;
+        asgRows[asgRowCount++] = { ARK_DEV_PRIMARY, (int16_t)p };
+        asgRows[asgRowCount++] = { ARK_DEV_PARAMS, (int16_t)p };
     }
-    for (int g = 0; g < ASG_GLOBALS && asgRowCount < ASG_MAXROWS; ++g) {
-        asgRows[asgRowCount] = { ARK_GLOBAL, (int16_t)g };
-        strncpy(asgBig[asgRowCount], PARAM_CATALOG[g].label, 15); asgBig[asgRowCount][15] = 0;
-        asgSmall[asgRowCount][0] = 0;
-        asgRowCount++;
-    }
-    const int  sp[3]  = { TUNER_VIEW, SETLIST_VIEW, RIG_VIEW };
-    const char* spn[3] = { "TUNER", "SETLIST", "RIG" };
-    for (int s = 0; s < 3 && asgRowCount < ASG_MAXROWS; ++s) {
-        asgRows[asgRowCount] = { ARK_SPECIAL, (int16_t)sp[s] };
-        strncpy(asgBig[asgRowCount], spn[s], 15); asgBig[asgRowCount][15] = 0;
-        asgSmall[asgRowCount][0] = 0;
-        asgRowCount++;
+    for (int g = 0; g < ASG_GLOBALS && asgRowCount < ASG_MAXROWS; ++g)
+        asgRows[asgRowCount++] = { ARK_GLOBAL, (int16_t)g };
+    const int sp[3] = { TUNER_VIEW, SETLIST_VIEW, RIG_VIEW };
+    for (int s = 0; s < 3 && asgRowCount < ASG_MAXROWS; ++s)
+        asgRows[asgRowCount++] = { ARK_SPECIAL, (int16_t)sp[s] };
+}
+
+// Display strings for one root row (big = category/control, small = device / "").
+void asgRowLabels(int r, char* big, size_t bl, char* small, size_t sl) {
+    big[0] = 0; small[0] = 0;
+    if (r < 0 || r >= asgRowCount) return;
+    const AsgRow& row = asgRows[r];
+    if (row.kind == ARK_DEV_PRIMARY) {
+        strncpy(big, gPresent[row.arg].label, bl - 1); big[bl - 1] = 0;
+        strncpy(small, gPresent[row.arg].device, sl - 1); small[sl - 1] = 0;
+    } else if (row.kind == ARK_DEV_PARAMS) {
+        strncpy(big, "more...", bl - 1); big[bl - 1] = 0;
+        strncpy(small, gPresent[row.arg].device, sl - 1); small[sl - 1] = 0;
+    } else if (row.kind == ARK_GLOBAL) {
+        strncpy(big, PARAM_CATALOG[row.arg].label, bl - 1); big[bl - 1] = 0;
+    } else {
+        const char* n = (row.arg == TUNER_VIEW) ? "TUNER" : (row.arg == SETLIST_VIEW) ? "SETLIST" : "RIG";
+        strncpy(big, n, bl - 1); big[bl - 1] = 0;
     }
 }
 
@@ -691,26 +702,25 @@ void commitAssign() {
     strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
     portEXIT_CRITICAL(&stateMux);
     saveHomeForRig(rigId);
-    rigChangedReq = true;
+    requestRigResolve();
 }
 
 void renderAssignRoot() {
     computeAsgSelected();
-    Render::drawAssignList(canvas, "ASSIGN", asgBig, asgSmall, asgRowCount, asgCursor, asgSel);
+    char big[16], small[24];
+    asgRowLabels(asgCursor, big, sizeof(big), small, sizeof(small));
+    Render::drawAssignList(canvas, "ASSIGN", big, small, asgRowCount, asgCursor, asgSel);
 }
 
-// Build the param-list display rows for the drilled device + mark which are in
-// the group. Returns nothing; reads gDevParam (filled by the net task).
+// Render the param drill-in: mark which params are in the group, show the current
+// one big. Reads gDevParam (filled by the net task).
 void renderAssignParams() {
     if (asgParamsDev < 0 || asgParamsDev >= gPresentCount) return;
     PresentDev& pd = gPresent[asgParamsDev];
     int n = gDevParamCount; if (n > 20) n = 20;
-    for (int i = 0; i < n; ++i) {
-        strncpy(pBig[i], gDevParam[i].label, 15); pBig[i][15] = 0;
-        pSmall[i][0] = 0;
-        pSel[i] = asgFindDevice(pd.path, gDevParam[i].prop) >= 0;
-    }
-    Render::drawAssignList(canvas, pd.device, pBig, pSmall, n, asgParamCursor, pSel);
+    for (int i = 0; i < n; ++i) pSel[i] = asgFindDevice(pd.path, gDevParam[i].prop) >= 0;
+    const char* big = (asgParamCursor >= 0 && asgParamCursor < n) ? gDevParam[asgParamCursor].label : "";
+    Render::drawAssignList(canvas, pd.device, big, "", n, asgParamCursor, pSel);
 }
 
 void enterAssignParams(int p) {
@@ -764,7 +774,7 @@ void onValueChanged(const String& path, const String& prop, const JsonVariantCon
         portENTER_CRITICAL(&stateMux);
         strncpy(libCurrentRigName, nm ? nm : "", 39); libCurrentRigName[39] = 0;
         portEXIT_CRITICAL(&stateMux);
-        rigChangedReq = true;   // rig swapped (footswitch / other controller) — re-resolve layout
+        requestRigResolve();   // rig swapped (footswitch / other controller) — re-resolve layout
     } else if (path == LIB_SETLISTS_PATH && prop == "loadedName" && value.is<const char*>()) {
         const char* nm = value.as<const char*>();
         portENTER_CRITICAL(&stateMux);
@@ -774,7 +784,7 @@ void onValueChanged(const String& path, const String& prop, const JsonVariantCon
     // Editing a rig (swap/add/remove a block) changes the Chain but not the rig
     // name, so re-resolve on any Chain structure change too — covers edits made
     // on the Prime or anywhere, not just rig selection.
-    if (path == "/Evil/Engine/Patch/Chain") rigChangedReq = true;
+    if (path == "/Evil/Engine/Patch/Chain") requestRigResolve();
     // Param echo for the active dial.
     if (path != activeBinding->path || prop != activeBinding->prop) return;
     portENTER_CRITICAL(&stateMux);
@@ -837,7 +847,6 @@ void serviceTuner() {
 // Library net-task helpers. Each fills shared buffers, then flips libReqDone.
 void doLibFetchSetlists() {
     libReqOk = false;
-    libSetlistCount = 0;
     JsonDocument doc;
     if (hr.getProperties(LIB_SETLISTS_PATH, doc)) {
         JsonArrayConst names = doc["SetlistNames"].as<JsonArrayConst>();
@@ -848,7 +857,7 @@ void doLibFetchSetlists() {
             strncpy(libSetlistIds[n], ids[i] | "", 39);     libSetlistIds[n][39] = 0;
             n++;
         }
-        libSetlistCount = n;
+        if (n > 0) libSetlistCount = n;   // keep the last good list on a transient/empty fetch
         libReqOk = (n > 0);
         const char* loaded = doc["loadedName"] | "";
         portENTER_CRITICAL(&stateMux);
@@ -861,7 +870,6 @@ void doLibFetchSetlists() {
 // Fetch the current setlist's rig list (names/ids/srIds) plus the loaded rig.
 void doFetchRigList() {
     libReqOk = false;
-    libRigCount = 0;
     JsonDocument doc;
     if (hr.getProperties(LIB_RIGS_PATH, doc)) {
         JsonArrayConst names = doc["RigNames"].as<JsonArrayConst>();
@@ -874,7 +882,7 @@ void doFetchRigList() {
             strncpy(libRigSrIds[n], (i < sr.size() ? (sr[i] | "") : ""), 39); libRigSrIds[n][39] = 0;
             n++;
         }
-        libRigCount = n;
+        if (n > 0) libRigCount = n;   // keep the last good list on a transient/empty fetch
         libReqOk = (n > 0);
         const char* nm = doc["loadedName"] | "";
         const char* id = doc["loadedID"] | "";
@@ -959,13 +967,21 @@ void buildFromPresent(int slot, int p) {
     gDynOk[slot] = true;
 }
 
-// Fill a dynamic slot from the first present device whose category is highest in
-// the bucket priority (and first in chain order). Returns true if filled.
-bool fillBucket(int slot, const BlockCat* bucket, int n) {
+// The present-device index a bucket would pick first (highest priority cat, first
+// in chain order), or -1 if none. Used so cross-fill can skip the other dial's pick.
+int bucketTop(const BlockCat* bucket, int n) {
     for (int b = 0; b < n; ++b)
         for (int p = 0; p < gPresentCount; ++p)
-            if (gPresent[p].cat == (uint8_t)bucket[b]) { buildFromPresent(slot, p); return true; }
-    return false;
+            if (gPresent[p].cat == (uint8_t)bucket[b]) return p;
+    return -1;
+}
+// Fill a dynamic slot from a bucket, optionally skipping one present index.
+// Returns the present index used, or -1 if none.
+int fillBucket(int slot, const BlockCat* bucket, int n, int except = -1) {
+    for (int b = 0; b < n; ++b)
+        for (int p = 0; p < gPresentCount; ++p)
+            if (p != except && gPresent[p].cat == (uint8_t)bucket[b]) { buildFromPresent(slot, p); return p; }
+    return -1;
 }
 
 // Resolve a pinned DEVICE member: exact block present -> bind it; else a block of
@@ -993,10 +1009,15 @@ void resolveDeviceSlot(int slot, HomeDesc& d) {
 void resolveSlot(int slot) {
     gDynOk[slot] = false;
     HomeDesc& d = gHomeDesc[slot];
+    // Cross-fill skips the OTHER bucket's top pick so a sparse rig (e.g. amp only)
+    // doesn't show the same device on both the Gain and Ambience dials — the empty
+    // one falls back to a global instead.
     if (d.kind == DK_BUCKET_GAIN) {
-        if (!fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT)) fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT);
+        if (fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT) < 0)
+            fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT, bucketTop(SPACE_BUCKET, SPACE_BUCKET_COUNT));
     } else if (d.kind == DK_BUCKET_SPACE) {
-        if (!fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT)) fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT);
+        if (fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT) < 0)
+            fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT, bucketTop(GAIN_BUCKET, GAIN_BUCKET_COUNT));
     } else if (d.kind == DK_DEVICE) {
         resolveDeviceSlot(slot, d);
     }
@@ -1129,6 +1150,8 @@ void checkForUpdate(const char* reason) {
     // (or we reboot into the new image on success).
     hr.stop();
     delay(50);
+    Serial.printf("[ota] %s: free=%uk maxblk=%uk\n", reason,
+                  (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
 
     // Verified TLS needs a real clock; re-sync (with retries) if the boot sync
     // didn't take. NTP is often blocked and a one-shot HTTPS Date can miss.
@@ -1312,7 +1335,7 @@ void netTask(void*) {
         });
         hr.begin(host);
         primeInitialValue();
-        rigChangedReq = true;   // resolve the loaded rig's layout once the link is up
+        requestRigResolve();   // resolve the loaded rig's layout once the link is up
         setupOTA();
         if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
             // Stagger the boot update-check so a rack of boards powered on together
@@ -1337,7 +1360,9 @@ void netTask(void*) {
         if (online) {
             ArduinoOTA.handle();  // blocks here for the duration of a push update
             if (otaCheckRequested) { otaCheckRequested = false; checkForUpdate("manual"); }
-            if (rigChangedReq) { rigChangedReq = false; doFetchRigList(); resolveLayoutForRig(); }  // rig swapped -> re-resolve dials
+            if (rigResolvePending && (millis() - rigResolveAtMs) > RIG_RESOLVE_DEBOUNCE_MS) {
+                rigResolvePending = false; doFetchRigList(); resolveLayoutForRig();   // resolve once the WS burst settles
+            }
             if (rebindRequested) { rebindRequested = false; if (!tunerActive && !homeListActive) primeInitialValue(); }  // new control focused
             if (libFetchSetlistsReq) { libFetchSetlistsReq = false; doLibFetchSetlists(); }
             if (fetchRigListReq)     { fetchRigListReq = false; doFetchRigList(); }
@@ -1378,6 +1403,15 @@ void setup() {
     Serial.printf("\n=== HeadRush Controller — Stage 1B (fw %d) ===\n", FW_VERSION);
 
     memset(gCatCache, -1, sizeof(gCatCache));   // block categories asked lazily from the Prime
+
+    // Library tables in PSRAM (frees internal SRAM for the OTA TLS handshake).
+    // ps_malloc draws from external RAM; fall back to internal if unavailable.
+    auto psAlloc = [](size_t sz) -> void* { void* p = ps_malloc(sz); return p ? p : malloc(sz); };
+    libSetlistNames = (char(*)[40])psAlloc(LIB_MAX_SETLISTS * 40);
+    libSetlistIds   = (char(*)[40])psAlloc(LIB_MAX_SETLISTS * 40);
+    libRigNames     = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
+    libRigIds       = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
+    libRigSrIds     = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
 
     // Ensure NVS is healthy. If the partition is in a bad/old state, the core
     // may not have reformatted it, making Preferences writes succeed in-session
