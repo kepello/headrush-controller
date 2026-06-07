@@ -97,35 +97,67 @@ const ContinuousBinding* activeBinding = &PARAM_CATALOG[0];
 const int TUNER_VIEW   = PARAM_COUNT;
 const int SETLIST_VIEW = PARAM_COUNT + 1;
 const int RIG_VIEW     = PARAM_COUNT + 2;
-// Dynamic, per-rig category dials (Gain bucket / Ambience bucket). These resolve
-// to whatever block fills the slot in the loaded rig (see resolveLayoutForRig).
-// gDynBind[0] backs DYN_GAIN_VIEW, gDynBind[1] backs DYN_SPACE_VIEW.
-const int DYN_GAIN_VIEW  = PARAM_COUNT + 3;
-const int DYN_SPACE_VIEW = PARAM_COUNT + 4;
-const int VIEW_COUNT   = PARAM_COUNT + 5;
+// A dynamic, per-rig dial. There is ONE marker view; a board's Home can hold
+// several, and each dynamic member's pool slot is simply its position in the
+// group. The net task resolves each to a concrete block+param for the loaded rig
+// (see resolveLayoutForRig); the descriptor in gHomeDesc[pos] says what it is.
+const int DYN_VIEW     = PARAM_COUNT + 3;
+const int VIEW_COUNT   = PARAM_COUNT + 4;
 inline bool viewIsTuner(int v)   { return v == TUNER_VIEW; }
 inline bool viewIsSetlist(int v) { return v == SETLIST_VIEW; }
 inline bool viewIsRig(int v)     { return v == RIG_VIEW; }
 inline bool viewIsList(int v)    { return v == SETLIST_VIEW || v == RIG_VIEW; }
-inline bool viewIsDyn(int v)     { return v == DYN_GAIN_VIEW || v == DYN_SPACE_VIEW; }
+inline bool viewIsDyn(int v)     { return v == DYN_VIEW; }
 inline bool viewIsValid(int v)   { return (v >= 0 && v < PARAM_COUNT) || v == TUNER_VIEW
-                                          || v == SETLIST_VIEW || v == RIG_VIEW || viewIsDyn(v); }
+                                          || v == SETLIST_VIEW || v == RIG_VIEW || v == DYN_VIEW; }
 
-// Resolved dynamic dials for the loaded rig. [0] = Gain bucket, [1] = Ambience.
-// The net task fills these from the Chain on every rig change; the UI binds to
-// them via DYN_*_VIEW. ContinuousBinding holds const char* fields, so the runtime
+const int MAX_GROUP = 8;   // max members in a board's Home group (= dynamic pool size)
+
+// What a dynamic member represents. BUCKET_* track a category by priority (the
+// default Gain/Ambience dials); DEVICE pins a specific block+param (an explicit
+// Assign pick) with category fallback. Stored in NVS as the user's intent; the
+// concrete block/value is always re-resolved live from the Prime on rig load.
+enum DescKind : uint8_t { DK_NONE = 0, DK_BUCKET_GAIN = 1, DK_BUCKET_SPACE = 2, DK_DEVICE = 3 };
+struct HomeDesc {
+    uint8_t kind;     // DescKind
+    uint8_t cat;      // BlockCat (DEVICE fallback / bucket result)
+    char path[44];    // DK_DEVICE: pinned block path ("" otherwise)
+    char prop[20];    // DK_DEVICE: pinned param ("" = the block's primary)
+};
+HomeDesc gHomeDesc[MAX_GROUP];   // descriptor per group position (valid where homeGroup[pos]==DYN_VIEW)
+
+// Resolved binding per group position (slot). Net writes during resolution, UI
+// reads to display. ContinuousBinding holds const char* fields, so the runtime
 // strings live in these backing buffers and the struct points into them.
-ContinuousBinding gDynBind[2];
-volatile bool     gDynOk[2] = { false, false };   // did the bucket resolve to a block?
-char gDynLabel[2][12];                             // big label = generic category ("COMP")
-char gDynDevice[2][24];                            // small subtitle = actual block ("Gray Comp")
-char gDynPath[2][48];
-char gDynProp[2][20];
-char gDynFmt[2][12];                               // printf format, parsed from device meta
-char gDynUnit[2][8];                               // unit suffix, parsed from device meta
+ContinuousBinding gDynBind[MAX_GROUP];
+volatile bool     gDynOk[MAX_GROUP];              // did this slot resolve to a block?
+char gDynLabel[MAX_GROUP][12];                    // big label = generic category ("COMP")
+char gDynDevice[MAX_GROUP][24];                   // small subtitle = actual block ("Gray Comp")
+char gDynPath[MAX_GROUP][48];
+char gDynProp[MAX_GROUP][20];
+char gDynFmt[MAX_GROUP][12];                      // printf format, parsed from device meta
+char gDynUnit[MAX_GROUP][8];                      // unit suffix, parsed from device meta
 volatile uint16_t gPresentCatMask = 0;            // bit c set => BlockCat c present in rig
-volatile bool     layoutDirty = false;            // net -> UI: rebuild Home for the new rig
+volatile bool     layoutDirty = false;            // net -> UI: a new resolved group is published
+volatile bool     gResolving = false;             // net -> UI: resolution in flight (show a spinner)
 int8_t gCatCache[MODULE_TYPE_COUNT];              // module idx -> BlockCat, -1 = not yet asked (net task)
+
+// The loaded rig's devices, built live from the Chain by the net task (never
+// persisted — the rig can change on the Prime while we're disconnected). Doubles
+// as the resolver's lookup table and the Assign screen's device list. Entries are
+// in signal-chain order; each carries the device's primary param + display spec.
+const int MAX_PRESENT = 16;
+struct PresentDev {
+    uint8_t cat;
+    char path[48];
+    char device[24];      // display name ("Gray Comp")
+    char label[12];       // generic category label ("COMP")
+    char prop[20];        // primary param
+    float dispMin, dispMax;
+    char fmt[16];         // raw device meta format ("%.0f %%"); split when a binding is built
+};
+PresentDev gPresent[MAX_PRESENT];
+volatile int gPresentCount = 0;   // net writes, UI reads (stable between rig changes)
 
 // Split a HeadRush meta format ("%.0f %%", "%.1f Cents", "%+.1f dB") into a bare
 // printf format ("%.0f") + unit ("%", "Cents", "dB"). The Prime embeds the unit
@@ -309,9 +341,11 @@ volatile int deviceId = 1;
 int paramIndex = 0;   // catalog index of the currently focused Home member
 
 // Home assignment: an ordered group of controls the knob carries. Single-click
-// cycles the focused member; turn adjusts it. Members are view indices — a param
-// dial (0..PARAM_COUNT-1) or TUNER_VIEW. Persisted per board in NVS.
-int  homeGroup[VIEW_COUNT] = { 0 };
+// cycles the focused member; turn adjusts it. Members are view indices (a global
+// dial 0..PARAM_COUNT-1, Tuner/Setlist/Rig, or DYN_VIEW). For a DYN_VIEW member,
+// gHomeDesc[pos] says what it is and gDynBind[pos] is its resolved binding.
+// Net task writes the resolved group on rig load; the UI reads it.
+int  homeGroup[MAX_GROUP] = { 0 };
 int  homeGroupLen = 1;
 int  homeFocus = 0;
 volatile bool homeListActive = false;   // focused Home member is Setlist/Rig (net task reads it)
@@ -330,15 +364,6 @@ void bindControl(int v) {
         libReqDone = false;
         if (viewIsSetlist(v)) libFetchSetlistsReq = true;
         else                  fetchRigListReq = true;
-    } else if (viewIsDyn(v)) {
-        int s = v - DYN_GAIN_VIEW;             // 0 = Gain, 1 = Ambience
-        if (gDynOk[s]) {
-            activeBinding = &gDynBind[s];
-        } else {
-            // Sparse rig: the bucket had no block. Fall back to a global so the
-            // dial still does something useful (Tempo for gain, Width for space).
-            activeBinding = &PARAM_CATALOG[s == 0 ? 2 : 3];
-        }
     } else {
         if (v < 0 || v >= PARAM_COUNT) v = 0;
         paramIndex = v;
@@ -347,11 +372,28 @@ void bindControl(int v) {
     rebindRequested = true;
 }
 
+// Bind a dynamic Home member (slot == its group position). Its binding was
+// resolved by the net task; if it didn't resolve (sparse rig / removed block)
+// fall back to a global so the dial still does something useful.
+void bindDynSlot(int slot) {
+    tunerActive = false;
+    homeListActive = false;
+    if (slot >= 0 && slot < MAX_GROUP && gDynOk[slot]) {
+        activeBinding = &gDynBind[slot];
+    } else {
+        int g = (slot >= 0 && slot < MAX_GROUP && gHomeDesc[slot].kind == DK_BUCKET_SPACE) ? 3 : 2;
+        activeBinding = &PARAM_CATALOG[g];   // Width / Tempo
+    }
+    rebindRequested = true;
+}
+
 // Focus the i-th member of the Home group (wraps) and bind it.
 void focusHomeMember(int i) {
     if (homeGroupLen < 1) homeGroupLen = 1;
     homeFocus = ((i % homeGroupLen) + homeGroupLen) % homeGroupLen;
-    bindControl(homeGroup[homeFocus]);
+    int v = homeGroup[homeFocus];
+    if (viewIsDyn(v)) bindDynSlot(homeFocus);
+    else              bindControl(v);
 }
 
 // UI screen model. Every screen obeys the universal grammar: turn = move,
@@ -427,37 +469,50 @@ void saveDeviceId(int id) {
     Serial.printf("[nvs] devid<-%d (open=%d wrote=%u readback=%d)\n", id, ok, (unsigned)n, rb);
 }
 
-void saveHomeGroup() {
-    Preferences p;
-    p.begin("hrctrl", false);
-    p.putInt("hglen", homeGroupLen);
-    p.putBytes("hgrp", homeGroup, homeGroupLen * sizeof(int));
-    p.end();
-    Serial.printf("[nvs] home group len=%d focus=%d\n", homeGroupLen, homeFocus);
-}
-
-// Per-rig HOME assignment (UX_MODEL §5). Keyed by the rig's stable loadedID so a
-// board adopts that rig's saved layout on load and falls back to generated
-// defaults otherwise. NVS keys are short (<=15 chars), so we hash the UUID into
-// "h<8 hex>l" (len) / "h<8 hex>g" (group bytes).
-void rigNvsKeys(const char* rigId, char* lenKey, char* grpKey) {
+// Per-rig HOME assignment (UX_MODEL §5), keyed by the rig's stable loadedID. NVS
+// keys are short (<=15 chars), so we hash the UUID into "h<8hex>L" (len) and
+// "h<8hex>M" (member blob). The blob stores the user's intent only — view index +
+// (for DYN members) the descriptor — never live Prime state. (The old "h..l/g"
+// int-only format from v29 is left orphaned; those rigs just regenerate defaults.)
+struct NvsMember {
+    int16_t view;     // homeGroup view index
+    uint8_t kind;     // HomeDesc kind (DK_NONE for non-DYN members)
+    uint8_t cat;      // BlockCat
+    char path[44];
+    char prop[20];
+};
+void rigNvsKeys(const char* rigId, char* lenKey, char* memKey) {
     uint32_t h = 2166136261u;                         // FNV-1a over the rig id
     for (const char* s = rigId; *s; ++s) { h ^= (uint8_t)*s; h *= 16777619u; }
-    snprintf(lenKey, 12, "h%08lxl", (unsigned long)h);
-    snprintf(grpKey, 12, "h%08lxg", (unsigned long)h);
+    snprintf(lenKey, 12, "h%08lxL", (unsigned long)h);
+    snprintf(memKey, 12, "h%08lxM", (unsigned long)h);
 }
 
+// Load this rig's saved group into homeGroup[]/gHomeDesc[]. Returns false if none
+// saved (caller generates defaults). Validation against the *live* rig happens
+// later in resolveMembers(); here we only restore intent.
 bool loadHomeForRig(const char* rigId) {
     if (!rigId || !rigId[0]) return false;
-    char lk[12], gk[12]; rigNvsKeys(rigId, lk, gk);
+    char lk[12], mk[12]; rigNvsKeys(rigId, lk, mk);
     Preferences p; p.begin("hrctrl", true);
     int len = p.getInt(lk, 0);
-    int tmp[VIEW_COUNT];
     bool ok = false;
-    if (len >= 1 && len <= VIEW_COUNT && p.getBytes(gk, tmp, len * sizeof(int)) == len * sizeof(int)) {
-        int n = 0;
-        for (int i = 0; i < len; ++i) if (viewIsValid(tmp[i])) homeGroup[n++] = tmp[i];
-        if (n > 0) { homeGroupLen = n; ok = true; }
+    if (len >= 1 && len <= MAX_GROUP) {
+        NvsMember tmp[MAX_GROUP];
+        size_t want = len * sizeof(NvsMember);
+        if (p.getBytes(mk, tmp, want) == want) {
+            int n = 0;
+            for (int i = 0; i < len; ++i) {
+                if (!viewIsValid(tmp[i].view)) continue;
+                homeGroup[n] = tmp[i].view;
+                gHomeDesc[n].kind = tmp[i].kind;
+                gHomeDesc[n].cat  = tmp[i].cat;
+                strncpy(gHomeDesc[n].path, tmp[i].path, sizeof(gHomeDesc[n].path)); gHomeDesc[n].path[sizeof(gHomeDesc[n].path)-1] = 0;
+                strncpy(gHomeDesc[n].prop, tmp[i].prop, sizeof(gHomeDesc[n].prop)); gHomeDesc[n].prop[sizeof(gHomeDesc[n].prop)-1] = 0;
+                n++;
+            }
+            if (n > 0) { homeGroupLen = n; ok = true; }
+        }
     }
     p.end();
     if (ok) Serial.printf("[nvs] loaded rig layout %s len=%d\n", rigId, homeGroupLen);
@@ -466,40 +521,38 @@ bool loadHomeForRig(const char* rigId) {
 
 void saveHomeForRig(const char* rigId) {
     if (!rigId || !rigId[0]) return;
-    char lk[12], gk[12]; rigNvsKeys(rigId, lk, gk);
+    char lk[12], mk[12]; rigNvsKeys(rigId, lk, mk);
+    NvsMember tmp[MAX_GROUP];
+    int n = homeGroupLen > MAX_GROUP ? MAX_GROUP : homeGroupLen;
+    memset(tmp, 0, sizeof(tmp));
+    for (int i = 0; i < n; ++i) {
+        tmp[i].view = (int16_t)homeGroup[i];
+        tmp[i].kind = gHomeDesc[i].kind;
+        tmp[i].cat  = gHomeDesc[i].cat;
+        strncpy(tmp[i].path, gHomeDesc[i].path, sizeof(tmp[i].path));
+        strncpy(tmp[i].prop, gHomeDesc[i].prop, sizeof(tmp[i].prop));
+    }
     Preferences p; p.begin("hrctrl", false);
-    p.putInt(lk, homeGroupLen);
-    p.putBytes(gk, homeGroup, homeGroupLen * sizeof(int));
+    p.putInt(lk, n);
+    p.putBytes(mk, tmp, n * sizeof(NvsMember));
     p.end();
-    Serial.printf("[nvs] saved rig layout %s len=%d\n", rigId, homeGroupLen);
+    Serial.printf("[nvs] saved rig layout %s len=%d\n", rigId, n);
 }
 
-// Generate this board's default HOME for the loaded rig (UX_MODEL §5). The role
-// is by device id (1..4 -> nav / gain / ambience / levels); >4 wraps. The Gain
-// and Ambience dials are DYN views whose concrete block was resolved by the net
-// task; here we only decide which dial this board carries.
+// Generate this board's default HOME for the loaded rig (UX_MODEL §5). Role by
+// device id (1..4 -> nav / gain / ambience / levels; >4 wraps). The Gain/Ambience
+// dials are DYN members whose descriptor tracks a bucket; the net task resolves
+// the concrete block. Sets homeGroup[]/gHomeDesc[]/homeGroupLen.
 void generateDefaultHome() {
+    memset(gHomeDesc, 0, sizeof(gHomeDesc));
     int role = (deviceId - 1) % 4;
     switch (role) {
         case 0:  homeGroup[0] = RIG_VIEW; homeGroup[1] = SETLIST_VIEW; homeGroupLen = 2; break;
-        case 1:  homeGroup[0] = DYN_GAIN_VIEW;  homeGroupLen = 1; break;
-        case 2:  homeGroup[0] = DYN_SPACE_VIEW; homeGroupLen = 1; break;
+        case 1:  homeGroup[0] = DYN_VIEW; homeGroupLen = 1; gHomeDesc[0].kind = DK_BUCKET_GAIN;  break;
+        case 2:  homeGroup[0] = DYN_VIEW; homeGroupLen = 1; gHomeDesc[0].kind = DK_BUCKET_SPACE; break;
         default: homeGroup[0] = 0; homeGroup[1] = 1; homeGroupLen = 2; break;  // OUTPUT, INPUT
     }
     Serial.printf("[layout] default home for board %d role %d len %d\n", deviceId, role, homeGroupLen);
-}
-
-// Rebuild HOME when a new rig loads: adopt the saved per-rig layout or fall back
-// to the generated default, then refocus (which re-primes the displayed value).
-// Called from the UI task when the net task raises layoutDirty.
-void rebuildHomeForRig() {
-    char rigId[40];
-    portENTER_CRITICAL(&stateMux);
-    strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
-    portEXIT_CRITICAL(&stateMux);
-    if (!loadHomeForRig(rigId)) generateDefaultHome();
-    homeFocus = 0;
-    focusHomeMember(0);
 }
 
 bool connectWifi(const WifiCreds& c) {
@@ -685,80 +738,135 @@ BlockCat resolveCat(int idx) {
     return c;
 }
 
-// Resolve the per-rig dynamic dials from the loaded rig's signal chain (net task).
-// Walks the 14 chain slots in order, maps each to a generic category (asked from
-// the Prime), then fills the Gain dial (Drive>Amp>Comp) and Ambience dial
-// (Reverb>Delay>Mod>Filter>Pitch) from the first present block in each bucket.
-// Empty buckets cross-fill from the other. The primary param is the first
-// candidate the actual block exposes; its range/format come from object-meta.
-void resolveLayoutForRig() {
-    gDynOk[0] = gDynOk[1] = false;
-    JsonDocument chain;
-    if (!hr.getProperties("/Evil/Engine/Patch/Chain", chain)) {
-        Serial.println("[layout] chain fetch FAIL");
-        layoutDirty = true;   // still let the UI rebuild (dials fall back to globals)
-        return;
-    }
-    // First chain slot (1-based, chain order) holding each generic category.
-    int firstSlotForCat[BC_COUNT];
-    for (int i = 0; i < BC_COUNT; ++i) firstSlotForCat[i] = -1;
+// Read one param's display spec (range + format) from object-meta. Falls back to
+// 0..100 "%.0f %%" (the common "amount" param) when meta is missing.
+void metaSpec(const String& path, const char* prop, float& mn, float& mx, char* fmt, size_t fl) {
+    mn = 0; mx = 100; strncpy(fmt, "%.0f %%", fl); fmt[fl - 1] = 0;
+    JsonDocument md;
+    if (!hr.getMeta(path, md)) return;
+    JsonVariantConst pm = md["properties"][prop];
+    if (pm.isNull()) return;
+    if (pm["minimum"].is<float>()) mn = pm["minimum"].as<float>();
+    if (pm["maximum"].is<float>()) mx = pm["maximum"].as<float>();
+    const char* f = pm["x-options"]["format"] | "";
+    if (f[0]) { strncpy(fmt, f, fl); fmt[fl - 1] = 0; }
+}
+
+// Build the loaded rig's live device list (net task): walk the chain in order,
+// and for each rideable block record its category, primary param, and display
+// spec. Drives both the resolver and the Assign screen. Never persisted.
+void buildPresent(JsonDocument& chain) {
+    gPresentCount = 0;
     uint16_t mask = 0;
-    for (int slot = 1; slot <= 14; ++slot) {
+    for (int slot = 1; slot <= 14 && gPresentCount < MAX_PRESENT; ++slot) {
         char key[16]; snprintf(key, sizeof(key), "ModuleType%d", slot);
         int idx = chain[key] | 0;
         BlockCat c = resolveCat(idx);
-        if (c == BC_NONE) continue;
+        const CatBindSpec* spec = catBindSpec(c);
+        if (!spec) continue;                          // not a rideable category
+        String path = moduleBlockPath(idx);
+        if (path.isEmpty()) continue;
+        JsonDocument bd;
+        if (!hr.getProperties(path, bd)) continue;
+        const char* prop = nullptr;
+        for (int k = 0; k < 5 && spec->candidates[k]; ++k)
+            if (bd[spec->candidates[k]].is<float>()) { prop = spec->candidates[k]; break; }
+        if (!prop) continue;
+        PresentDev& pd = gPresent[gPresentCount++];
+        pd.cat = (uint8_t)c;
+        strncpy(pd.path, path.c_str(), sizeof(pd.path) - 1); pd.path[sizeof(pd.path) - 1] = 0;
+        strncpy(pd.device, moduleName(idx).c_str(), sizeof(pd.device) - 1); pd.device[sizeof(pd.device) - 1] = 0;
+        strncpy(pd.label, spec->label, sizeof(pd.label) - 1); pd.label[sizeof(pd.label) - 1] = 0;
+        strncpy(pd.prop, prop, sizeof(pd.prop) - 1); pd.prop[sizeof(pd.prop) - 1] = 0;
+        metaSpec(path, prop, pd.dispMin, pd.dispMax, pd.fmt, sizeof(pd.fmt));
         mask |= (uint16_t)(1u << c);
-        if (firstSlotForCat[c] < 0) firstSlotForCat[c] = idx;   // store module idx
     }
     gPresentCatMask = mask;
+}
 
-    // Pick the first present category from a bucket whose block exposes a usable
-    // param, build gDynBind[slot], and return the category used (or BC_NONE).
-    auto fill = [&](int dslot, const BlockCat* bucket, int bn, BlockCat exclude) -> BlockCat {
-        for (int i = 0; i < bn; ++i) {
-            BlockCat c = bucket[i];
-            if (c == exclude || firstSlotForCat[c] < 0) continue;
-            const CatBindSpec* spec = catBindSpec(c);
-            if (!spec) continue;
-            int idx = firstSlotForCat[c];
-            String path = moduleBlockPath(idx);
-            if (path.isEmpty()) continue;
-            JsonDocument bd;
-            if (!hr.getProperties(path, bd)) continue;
-            for (int k = 0; k < 5 && spec->candidates[k]; ++k) {
-                const char* prop = spec->candidates[k];
-                if (!bd[prop].is<float>()) continue;
-                // Range + format live from the device so any unit renders right.
-                float mn = 0, mx = 100; const char* fmt = "%.0f %%";
-                JsonDocument md;
-                if (hr.getMeta(path, md)) {
-                    JsonVariantConst pm = md["properties"][prop];
-                    if (!pm.isNull()) {
-                        if (pm["minimum"].is<float>()) mn = pm["minimum"].as<float>();
-                        if (pm["maximum"].is<float>()) mx = pm["maximum"].as<float>();
-                        const char* f = pm["x-options"]["format"] | "";
-                        if (f[0]) fmt = f;
-                    }
-                }
-                String dev = moduleName(idx);
-                buildDynBinding(dslot, spec->label, dev.c_str(), path, prop, mn, mx, fmt);
-                gDynOk[dslot] = true;
-                Serial.printf("[layout] dial%d = %s [%s] %s.%s\n", dslot + 1, spec->label,
-                              dev.c_str(), path.c_str(), prop);
-                return c;
-            }
+void buildFromPresent(int slot, int p) {
+    PresentDev& pd = gPresent[p];
+    buildDynBinding(slot, pd.label, pd.device, String(pd.path), pd.prop, pd.dispMin, pd.dispMax, pd.fmt);
+    gDynOk[slot] = true;
+}
+
+// Fill a dynamic slot from the first present device whose category is highest in
+// the bucket priority (and first in chain order). Returns true if filled.
+bool fillBucket(int slot, const BlockCat* bucket, int n) {
+    for (int b = 0; b < n; ++b)
+        for (int p = 0; p < gPresentCount; ++p)
+            if (gPresent[p].cat == (uint8_t)bucket[b]) { buildFromPresent(slot, p); return true; }
+    return false;
+}
+
+// Resolve a pinned DEVICE member: exact block present -> bind it; else a block of
+// the same category -> follow to it; else leave unresolved (UI falls to a global).
+void resolveDeviceSlot(int slot, HomeDesc& d) {
+    for (int p = 0; p < gPresentCount; ++p) {
+        if (strcmp(gPresent[p].path, d.path) != 0) continue;
+        if (d.prop[0] && strcmp(d.prop, gPresent[p].prop) != 0) {
+            float mn, mx; char fmt[16];
+            metaSpec(String(d.path), d.prop, mn, mx, fmt, sizeof(fmt));
+            const CatBindSpec* spec = catBindSpec((BlockCat)d.cat);
+            buildDynBinding(slot, spec ? spec->label : gPresent[p].label, gPresent[p].device,
+                            String(d.path), d.prop, mn, mx, fmt);
+            gDynOk[slot] = true;
+        } else {
+            buildFromPresent(slot, p);
         }
-        return BC_NONE;
-    };
+        return;
+    }
+    for (int p = 0; p < gPresentCount; ++p)
+        if (gPresent[p].cat == d.cat) { buildFromPresent(slot, p); return; }
+    gDynOk[slot] = false;
+}
 
-    BlockCat gainCat  = fill(0, GAIN_BUCKET, GAIN_BUCKET_COUNT, BC_NONE);
-    BlockCat spaceCat = fill(1, SPACE_BUCKET, SPACE_BUCKET_COUNT, gainCat);
-    // Cross-fill: a board with an empty bucket borrows the other bucket's leftover.
-    if (!gDynOk[0]) gainCat  = fill(0, SPACE_BUCKET, SPACE_BUCKET_COUNT, spaceCat);
-    if (!gDynOk[1]) spaceCat = fill(1, GAIN_BUCKET,  GAIN_BUCKET_COUNT,  gainCat);
+void resolveSlot(int slot) {
+    gDynOk[slot] = false;
+    HomeDesc& d = gHomeDesc[slot];
+    if (d.kind == DK_BUCKET_GAIN) {
+        if (!fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT)) fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT);
+    } else if (d.kind == DK_BUCKET_SPACE) {
+        if (!fillBucket(slot, SPACE_BUCKET, SPACE_BUCKET_COUNT)) fillBucket(slot, GAIN_BUCKET, GAIN_BUCKET_COUNT);
+    } else if (d.kind == DK_DEVICE) {
+        resolveDeviceSlot(slot, d);
+    }
+}
 
-    layoutDirty = true;   // tell the UI to rebuild HOME from the new layout
+// Resolve every DYN member of the current group into its binding slot.
+void resolveMembers() {
+    for (int i = 0; i < homeGroupLen && i < MAX_GROUP; ++i) {
+        if (homeGroup[i] == DYN_VIEW) {
+            resolveSlot(i);
+            if (gDynOk[i]) Serial.printf("[layout] slot%d = %s [%s] %s.%s\n", i,
+                gDynBind[i].label, gDynBind[i].device, gDynBind[i].path, gDynBind[i].prop);
+            else Serial.printf("[layout] slot%d unresolved -> global fallback\n", i);
+        } else {
+            gDynOk[i] = false;
+        }
+    }
+}
+
+// Per-rig resolution, owned by the net task (UX_MODEL §5; ownership model in
+// PLAN #1): build the live device list, adopt this rig's saved group (or generate
+// + persist the default), resolve every member, and publish to the UI. Called on
+// rig load and on rig edits (chain change), and after an Assign save.
+void resolveLayoutForRig() {
+    gResolving = true;
+    JsonDocument chain;
+    if (hr.getProperties("/Evil/Engine/Patch/Chain", chain)) buildPresent(chain);
+    else { Serial.println("[layout] chain fetch FAIL"); gPresentCount = 0; }
+
+    char rigId[40];
+    portENTER_CRITICAL(&stateMux);
+    strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
+    portEXIT_CRITICAL(&stateMux);
+
+    if (!loadHomeForRig(rigId)) { generateDefaultHome(); saveHomeForRig(rigId); }
+    resolveMembers();
+
+    gResolving = false;
+    layoutDirty = true;   // UI: a new resolved group is ready
 }
 
 // Load the setlist whose id is in libSelSetlistId.
@@ -1090,15 +1198,6 @@ void setup() {
 
     prefs.begin("hrctrl", true);
     deviceId = prefs.getInt("devid", 0);   // 0 = never provisioned
-    homeGroupLen = prefs.getInt("hglen", 0);
-    if (homeGroupLen >= 1 && homeGroupLen <= VIEW_COUNT) {
-        prefs.getBytes("hgrp", homeGroup, homeGroupLen * sizeof(int));
-    } else {
-        // Migrate an older single-param install (NVS key "param") to a 1-member group.
-        int p = prefs.getInt("param", 0);
-        if (p < 0 || p >= PARAM_COUNT) p = 0;
-        homeGroup[0] = p; homeGroupLen = 1;
-    }
     prefs.end();
 #ifdef PROVISION_ID
     // Fleet provisioning: bake this unit's ID at flash time, but only if it
@@ -1106,18 +1205,12 @@ void setup() {
     if (deviceId == 0) { deviceId = PROVISION_ID; saveDeviceId(deviceId); }
 #endif
     if (deviceId < 1 || deviceId > 16) deviceId = 1;
-    // Validate group members against the known view set.
-    int n = 0;
-    for (int i = 0; i < homeGroupLen && i < VIEW_COUNT; ++i) {
-        int v = homeGroup[i];
-        if (viewIsValid(v)) homeGroup[n++] = v;
-    }
-    homeGroupLen = (n > 0) ? n : 1;
-    if (n == 0) homeGroup[0] = 0;
-    homeFocus = 0;
+    // Boot placeholder: the per-rig group is net-owned and gets published once the
+    // Prime link is up (resolveLayoutForRig). Show Output until then.
+    memset(gHomeDesc, 0, sizeof(gHomeDesc));
+    homeGroup[0] = 0; homeGroupLen = 1; homeFocus = 0;
     focusHomeMember(0);
-    Serial.printf("Device ID: %d, home group len=%d, view %s\n", deviceId, homeGroupLen,
-                  tunerActive ? "Tuner" : activeBinding->label);
+    Serial.printf("Device ID: %d (awaiting rig resolve)\n", deviceId);
 
     pinMode(HW::PIN_PWR_EN_1, OUTPUT); digitalWrite(HW::PIN_PWR_EN_1, HIGH);
     pinMode(HW::PIN_PWR_EN_2, OUTPUT); digitalWrite(HW::PIN_PWR_EN_2, HIGH);
@@ -1149,13 +1242,13 @@ void loop() {
     if (otaActive || otaChecking || !bootComplete) noteActivity();
     updateBacklight();
 
-    // A rig change (net task resolved a new layout): adopt this rig's saved HOME
-    // assignment or the generated default, then refocus to refresh the dial. Only
-    // rebuild while on HOME — a menu the user is in shouldn't yank out from under
-    // them; the new layout takes effect when they return to HOME.
+    // A rig change: the net task has published a freshly resolved group. Just
+    // refocus to bind + refresh the dial (the group itself is net-owned now). Only
+    // act while on HOME — a menu the user is in shouldn't yank out from under them;
+    // the new layout takes effect when they return to HOME.
     if (layoutDirty && screen == SC_HOME) {
         layoutDirty = false;
-        rebuildHomeForRig();
+        focusHomeMember(0);
         lastRenderedValue = -999999.0f;   // force a redraw with the new value
     }
 
@@ -1266,15 +1359,19 @@ void loop() {
                         : (assignCursor == PARAM_COUNT + 1) ? SETLIST_VIEW : RIG_VIEW;
         if (longPress) {                      // confirm the group, back to Home
             if (assignSelLen > 0) {
-                homeGroupLen = assignSelLen;
-                for (int i = 0; i < assignSelLen; ++i) homeGroup[i] = assignSel[i];
-                saveHomeGroup();              // global fallback (used until a rig is known)
-                char rigId[40];              // and persist this layout for the loaded rig
+                int n = assignSelLen > MAX_GROUP ? MAX_GROUP : assignSelLen;
+                homeGroupLen = n;
+                for (int i = 0; i < n; ++i) {  // legacy global/special picks: no descriptor
+                    homeGroup[i] = assignSel[i];
+                    gHomeDesc[i].kind = DK_NONE; gHomeDesc[i].cat = 0;
+                    gHomeDesc[i].path[0] = 0; gHomeDesc[i].prop[0] = 0;
+                }
+                char rigId[40];              // persist this layout for the loaded rig
                 portENTER_CRITICAL(&stateMux);
                 strncpy(rigId, libCurrentRigId, sizeof(rigId)); rigId[sizeof(rigId) - 1] = 0;
                 portEXIT_CRITICAL(&stateMux);
                 saveHomeForRig(rigId);
-                focusHomeMember(0);
+                rigChangedReq = true;        // net reloads + resolves + republishes
             }
             screen = SC_HOME;
             lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
@@ -1287,7 +1384,7 @@ void loop() {
             if (at >= 0) {                    // remove (preserve order)
                 for (int i = at; i < assignSelLen - 1; ++i) assignSel[i] = assignSel[i + 1];
                 assignSelLen--;
-            } else if (assignSelLen < VIEW_COUNT) {
+            } else if (assignSelLen < MAX_GROUP) {
                 assignSel[assignSelLen++] = cursorView;   // append in selection order
             }
             Render::drawAssignList(canvas, PARAM_CATALOG, PARAM_COUNT, assignCursor, assignSel, assignSelLen);
