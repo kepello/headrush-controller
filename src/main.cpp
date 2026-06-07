@@ -140,7 +140,7 @@ char gDynUnit[MAX_GROUP][8];                      // unit suffix, parsed from de
 volatile uint16_t gPresentCatMask = 0;            // bit c set => BlockCat c present in rig
 volatile bool     layoutDirty = false;            // net -> UI: a new resolved group is published
 volatile bool     gResolving = false;             // net -> UI: resolution in flight (show a spinner)
-int8_t gCatCache[MODULE_TYPE_COUNT];              // module idx -> BlockCat, -1 = not yet asked (net task)
+int8_t gCatCache[MAX_MODTYPES];                   // module idx -> BlockCat, -1 = not yet asked (net task)
 
 // The loaded rig's devices, built live from the Chain by the net task (never
 // persisted — the rig can change on the Prime while we're disconnected). Doubles
@@ -894,12 +894,32 @@ void doFetchRigList() {
     libReqDone = true;
 }
 
+// Fetch the device's live ModuleTypes (index -> name) once and cache it in PSRAM,
+// so resolution uses the Prime's current block list rather than the baked
+// snapshot — robust to firmware updates / new blocks. Net task only; idempotent.
+void loadModuleTypes() {
+    if (gModCountRT > 0 || !gModNameRT) return;
+    JsonDocument doc;
+    if (!hr.getProperties("/Evil/API/Blocks", doc)) return;
+    JsonArrayConst mt = doc["ModuleTypes"].as<JsonArrayConst>();
+    int n = 0;
+    for (size_t i = 0; i < mt.size() && n < MAX_MODTYPES; ++i) {
+        strncpy(gModNameRT[n], mt[i] | "", 31); gModNameRT[n][31] = 0;
+        n++;
+    }
+    if (n > 0) {
+        gModCountRT = n;
+        memset(gCatCache, -1, sizeof(gCatCache));   // indices may have shifted vs the baked table
+        Serial.printf("[blocks] %d module types loaded from device\n", n);
+    }
+}
+
 // Generic category for a chain module index, asked from the Prime itself
 // (categoryOfBlock) so a newly added/downloaded block categorizes correctly,
 // cached per index for the session. Falls back to the baked table if the device
 // call fails. Net task only.
 BlockCat resolveCat(int idx) {
-    if (idx <= 0 || idx >= MODULE_TYPE_COUNT) return BC_NONE;
+    if (idx <= 0 || idx >= MAX_MODTYPES) return BC_NONE;
     if (gCatCache[idx] >= 0) return (BlockCat)gCatCache[idx];
     BlockCat c = moduleCategory(idx);          // baked fallback (pre-seeded snapshot)
     String name = moduleName(idx);
@@ -1043,6 +1063,7 @@ void resolveMembers() {
 // rig load and on rig edits (chain change), and after an Assign save.
 void resolveLayoutForRig() {
     gResolving = true;
+    loadModuleTypes();           // ensure the live block list is cached (once)
     JsonDocument chain;
     if (hr.getProperties("/Evil/Engine/Patch/Chain", chain)) buildPresent(chain);
     else { Serial.println("[layout] chain fetch FAIL"); gPresentCount = 0; }
@@ -1412,6 +1433,7 @@ void setup() {
     libRigNames     = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
     libRigIds       = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
     libRigSrIds     = (char(*)[40])psAlloc(LIB_MAX_RIGS * 40);
+    gModNameRT      = (char(*)[32])psAlloc(MAX_MODTYPES * 32);   // live ModuleTypes cache
 
     // Ensure NVS is healthy. If the partition is in a bad/old state, the core
     // may not have reformatted it, making Preferences writes succeed in-session

@@ -326,14 +326,25 @@ const char* const MODULE_NAME[MODULE_TYPE_COUNT] PROGMEM = {
     "FX-Loop",
 };
 
-inline BlockCat moduleCategory(int idx) {
+// Runtime ModuleTypes cache, fetched live from the Prime (/Evil/API/Blocks) and
+// preferred over the baked snapshot below — so a Prime firmware update that
+// reorders/adds module types resolves correctly without regenerating this file.
+// Allocated in PSRAM + filled by the net task (loadModuleTypes); null until then,
+// when the baked table is the fallback. Single translation unit (main.cpp).
+const int MAX_MODTYPES = 320;          // room above the current 272 for firmware additions
+char (*gModNameRT)[32] = nullptr;      // [idx] -> name, or null if not yet loaded
+int  gModCountRT = 0;
+
+inline BlockCat moduleCategory(int idx) {   // baked fallback only; runtime path is resolveCat()
     if (idx < 0 || idx >= MODULE_TYPE_COUNT) return BC_NONE;
     return (BlockCat)pgm_read_byte(&MODULE_CATEGORY[idx]);
 }
 
 inline String moduleName(int idx) {
+    if (gModNameRT && idx >= 0 && idx < gModCountRT && gModNameRT[idx][0])
+        return String(gModNameRT[idx]);                 // live from the device
     if (idx < 0 || idx >= MODULE_TYPE_COUNT) return String();
-    return String((const char*)pgm_read_ptr(&MODULE_NAME[idx]));
+    return String((const char*)pgm_read_ptr(&MODULE_NAME[idx]));   // baked fallback
 }
 
 // Map the Prime's own display category string (from categoryOfBlock /
@@ -357,9 +368,9 @@ inline BlockCat genericCatFromDeviceString(const char* s) {
 
 // Build "/Evil/Engine/Patch/<name>" for a module index (spaces/slash -> _).
 inline String moduleBlockPath(int idx) {
-    if (idx <= 0 || idx >= MODULE_TYPE_COUNT) return String();
-    String n = (const char*)pgm_read_ptr(&MODULE_NAME[idx]);
-    if (n == "Empty Slot") return String();
+    if (idx <= 0) return String();
+    String n = moduleName(idx);
+    if (n.isEmpty() || n == "Empty Slot") return String();
     for (size_t i = 0; i < n.length(); ++i) { char c = n[i]; if (c == ' ' || c == '/') n[i] = '_'; }
     return String("/Evil/Engine/Patch/") + n;
 }
