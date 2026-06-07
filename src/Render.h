@@ -59,7 +59,12 @@ inline void drawStatusIndicators(LGFX_Sprite& gfx, uint16_t statusColor, int sig
 // grows with the count — a couple of dots sit right at the top; as the list grows
 // the spread widens up to the full gauge sweep (then packs tighter). Replaces a
 // value bar on list screens, which have no continuous value to show.
-inline void drawArcDots(LGFX_Sprite& gfx, int count, int sel) {
+//
+// Single-select (selected == nullptr): the cursor dot is filled bright, the rest
+// dim. Multi-select (selected[] given, e.g. the Assign list): a dot's FILL shows
+// whether it's chosen (bright vs dim) and an accent RING marks the cursor — so
+// the two states read independently (chosen-and-here = bright dot + ring).
+inline void drawArcDots(LGFX_Sprite& gfx, int count, int cursor, const bool* selected = nullptr) {
     if (count <= 0) return;
     constexpr float R = (ARC_INNER_R + ARC_OUTER_R) / 2.0f;   // 108, the bar band
     constexpr float TOP_DEG = 270.0f;                         // 12 o'clock
@@ -72,7 +77,9 @@ inline void drawArcDots(LGFX_Sprite& gfx, int count, int sel) {
         float rad = a * 0.017453293f;
         int x = CX + (int)lroundf(R * cosf(rad));
         int y = CY + (int)lroundf(R * sinf(rad));
-        gfx.fillCircle(x, y, r, (i == sel) ? COLOR_VALUE : COLOR_LABEL);
+        bool on = selected ? selected[i] : (i == cursor);
+        gfx.fillCircle(x, y, r, on ? COLOR_VALUE : COLOR_LABEL);
+        if (selected && i == cursor) gfx.drawCircle(x, y, r + 3, COLOR_FALLBACK);  // cursor ring
     }
 }
 
@@ -315,30 +322,28 @@ inline void drawSplash(LGFX_Sprite& gfx, int deviceId, int fwVersion, const char
     gfx.pushSprite(0, 0);
 }
 
-// Simple vertical menu: a title and a list of items, `sel` highlighted with a
-// leading ">". Shared by the Board Menu and Settings menu.
+// Simple menu, rendered with the same paradigm as every other list: title, the
+// current item big in the center, position shown by the arc dots. Turn moves the
+// cursor, click selects. Shared by the Board Menu and Settings menu.
 inline void drawSimpleMenu(LGFX_Sprite& gfx, const char* title, const char* const* labels, int count, int sel, const char* footer = nullptr) {
     gfx.fillScreen(COLOR_BG);
     gfx.setTextDatum(middle_center);
+    drawArcDots(gfx, count, sel);
+
     gfx.setTextColor(COLOR_LABEL, COLOR_BG);
     gfx.setFont(&fonts::FreeSansBold12pt7b);
-    gfx.drawString(title, CX, 28);
-    int y0 = 120 - ((count - 1) * 32) / 2;   // vertically centered block
-    for (int i = 0; i < count; ++i) {
-        int y = y0 + i * 32;
-        bool s = (i == sel);
-        gfx.setTextColor(s ? COLOR_VALUE : COLOR_LABEL, COLOR_BG);
-        gfx.setFont(&fonts::FreeSansBold12pt7b);
-        gfx.drawString(labels[i], CX, y);
-        if (s) gfx.drawString(">", CX - 104, y);
-    }
+    gfx.drawString(title, CX, CY - 50);
+
+    const char* cur = (sel >= 0 && sel < count) ? labels[sel] : "";
+    gfx.setTextColor(COLOR_VALUE, COLOR_BG);
+    gfx.setFont(strlen(cur) > 9 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold18pt7b);
+    gfx.drawString(cur, CX, CY + 4);
+
     if (footer) {
         gfx.setTextColor(COLOR_LABEL, COLOR_BG);
         gfx.setFont(&fonts::FreeSansBold9pt7b);
-        gfx.drawString(footer, CX, 212);
+        gfx.drawString(footer, CX, 206);
     }
-    // No arc dots here: the menu shows all items at once with a cursor, so the
-    // position is already visible (and the title sits where the top dots land).
     gfx.pushSprite(0, 0);
 }
 
