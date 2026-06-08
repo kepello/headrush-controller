@@ -1350,6 +1350,21 @@ void netTask(void*) {
         Serial.printf("[net] time = %ld\n", (long)time(nullptr));
 
         String host = resolveHost(c);
+
+        // OTA pull check FIRST — on the clean pre-WebSocket heap. Verified TLS
+        // needs a large *contiguous* block; connecting the WS (hr.begin) fragments
+        // the heap to ~30k and the handshake fails "-1", even with ~60k total free.
+        // Run it here, where the heap is clean (the same reason the clock sync above
+        // succeeds). Stagger so a rack of boards doesn't all hit TLS + the ~1.4MB
+        // download at once. A successful update reboots into the new image.
+        if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
+            uint32_t jitterMs = (uint32_t)(deviceId - 1) * 3000 + (esp_random() % 2000);
+            snprintf(bootMsg, sizeof(bootMsg), "update in %us", (unsigned)((jitterMs + 999) / 1000));
+            vTaskDelay(pdMS_TO_TICKS(jitterMs));
+            checkForUpdate("boot");
+        }
+
+        // Now link the Prime (WebSocket) and set up push-OTA.
         snprintf(bootMsg, sizeof(bootMsg), "linking Prime");
         hr.onValueChanged(onValueChanged);
         hr.onConnection([](bool up) {
@@ -1360,16 +1375,6 @@ void netTask(void*) {
         primeInitialValue();
         requestRigResolve();   // resolve the loaded rig's layout once the link is up
         setupOTA();
-        if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
-            // Stagger the boot update-check so a rack of boards powered on together
-            // don't all hit WiFi/TLS + the ~1.4MB download at once (which starved
-            // one unit and made it time out). Per-device base slot guarantees
-            // separation; esp_random() jitter keeps them from relocking each boot.
-            uint32_t jitterMs = (uint32_t)(deviceId - 1) * 3000 + (esp_random() % 2000);
-            snprintf(bootMsg, sizeof(bootMsg), "update in %us", (unsigned)((jitterMs + 999) / 1000));
-            vTaskDelay(pdMS_TO_TICKS(jitterMs));
-            checkForUpdate("boot");
-        }
     } else {
         connStatus = CS_WIFI_ERR;
         snprintf(bootMsg, sizeof(bootMsg), "WiFi failed");
