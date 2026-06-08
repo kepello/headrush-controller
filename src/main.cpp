@@ -621,18 +621,19 @@ void asgToggleView(int view) {
     asgLen++;
 }
 
-// Build the rig-derived root rows (devices in chain order: primary + "more…";
-// then globals; then Tuner/Setlist/Rig). Labels are computed on the fly when
-// rendering (only the current row is shown), so no per-row string storage.
+// Build the rig-derived root rows: globals first (always available, predictable),
+// then the rig's devices (primary + "more…"), then Tuner/Setlist/Rig. Labels are
+// computed on the fly when rendering (only the current row shows), so no per-row
+// string storage.
 void buildAssignRows() {
     asgRowCount = 0;
+    for (int g = 0; g < ASG_GLOBALS && asgRowCount < ASG_MAXROWS; ++g)
+        asgRows[asgRowCount++] = { ARK_GLOBAL, (int16_t)g };
     int pc = gPresentCount; if (pc > MAX_PRESENT) pc = MAX_PRESENT;
     for (int p = 0; p < pc && asgRowCount < ASG_MAXROWS - 2; ++p) {
         asgRows[asgRowCount++] = { ARK_DEV_PRIMARY, (int16_t)p };
         asgRows[asgRowCount++] = { ARK_DEV_PARAMS, (int16_t)p };
     }
-    for (int g = 0; g < ASG_GLOBALS && asgRowCount < ASG_MAXROWS; ++g)
-        asgRows[asgRowCount++] = { ARK_GLOBAL, (int16_t)g };
     const int sp[3] = { TUNER_VIEW, SETLIST_VIEW, RIG_VIEW };
     for (int s = 0; s < 3 && asgRowCount < ASG_MAXROWS; ++s)
         asgRows[asgRowCount++] = { ARK_SPECIAL, (int16_t)sp[s] };
