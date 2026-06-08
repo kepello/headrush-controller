@@ -1176,10 +1176,11 @@ void checkForUpdate(const char* reason) {
     Serial.printf("[ota] %s: free=%uk maxblk=%uk\n", reason,
                   (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMaxAllocHeap() / 1024));
 
-    // Verified TLS needs a real clock; re-sync (with retries) if the boot sync
-    // didn't take. NTP is often blocked and a one-shot HTTPS Date can miss.
-    for (int i = 0; i < 3 && time(nullptr) < 1700000000; ++i)
-        if (!syncClockFromHttp()) delay(800);
+    // Insecure TLS (no cert validation): verified TLS can't fit the WiFi-fragmented
+    // ~30k contiguous heap on this board, so the check/download would fail "-1".
+    // Insecure needs ~6k less and no clock. Trade-off: a network MITM could serve
+    // fake firmware — acceptable on a trusted LAN; revisit with smaller mbedTLS
+    // buffers (sdkconfig) if hardening is wanted.
 
     // Fetch the manifest, retrying transient TLS/network failures. A unique
     // cache-busting query + no-cache headers force a fresh version.json: without
@@ -1189,7 +1190,7 @@ void checkForUpdate(const char* reason) {
     String body;
     for (int attempt = 0; attempt < 3 && code != HTTP_CODE_OK; ++attempt) {
         NetworkClientSecure client;
-        client.setCACert(GITHUB_ROOTS);  // pinned GitHub roots (the IDF bundle wouldn't validate)
+        client.setInsecure();  // see note above — verified TLS won't fit the heap
         HTTPClient http;
         http.setConnectTimeout(10000);
         http.setTimeout(10000);
@@ -1242,7 +1243,7 @@ void checkForUpdate(const char* reason) {
         String dlUrl = url + (url.indexOf('?') >= 0 ? "&cb=" : "?cb=")
                        + String((uint32_t)millis()) + String(random(1000000));
         NetworkClientSecure dlClient;
-        dlClient.setCACert(GITHUB_ROOTS);
+        dlClient.setInsecure();   // see note in the manifest fetch above
         r = httpUpdate.update(dlClient, dlUrl);
         // Only reached if the update did NOT succeed (success reboots).
         otaActive = false;
@@ -1340,23 +1341,14 @@ void netTask(void*) {
 
     if (online) {
         connStatus = CS_WIFI;
-        // Set the clock for verified TLS (cert date checks). Try NTP briefly,
-        // then fall back to the HTTPS Date header (NTP/UDP is blocked on some
-        // networks while TCP/443 works). No real clock = certs look not-yet-valid.
-        snprintf(bootMsg, sizeof(bootMsg), "setting clock");
-        configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-        for (uint32_t t0 = millis(); time(nullptr) < 1700000000 && millis() - t0 < 4000; ) delay(200);
-        if (time(nullptr) < 1700000000) syncClockFromHttp();
-        Serial.printf("[net] time = %ld\n", (long)time(nullptr));
 
-        String host = resolveHost(c);
-
-        // OTA pull check FIRST — on the clean pre-WebSocket heap. Verified TLS
-        // needs a large *contiguous* block; connecting the WS (hr.begin) fragments
-        // the heap to ~30k and the handshake fails "-1", even with ~60k total free.
-        // Run it here, where the heap is clean (the same reason the clock sync above
-        // succeeds). Stagger so a rack of boards doesn't all hit TLS + the ~1.4MB
-        // download at once. A successful update reboots into the new image.
+        // OTA pull check FIRST, on the cleanest heap — before the clock sync or the
+        // WebSocket fragment it. WiFi caps the largest contiguous block at ~30k, and
+        // VERIFIED TLS needs more than that (it fails "-1" even with ~60k total
+        // free), so the OTA uses INSECURE TLS — same as the clock sync, which is why
+        // that has always worked. Insecure needs no clock either. Trade-off: no
+        // cert validation (acceptable on a trusted LAN; see checkForUpdate). Stagger
+        // so a rack doesn't all hit TLS + the ~1.4MB download at once.
         if (FW_VERSION > 0) {  // dev builds (fw 0) skip auto-update
             uint32_t jitterMs = (uint32_t)(deviceId - 1) * 3000 + (esp_random() % 2000);
             snprintf(bootMsg, sizeof(bootMsg), "update in %us", (unsigned)((jitterMs + 999) / 1000));
@@ -1364,7 +1356,12 @@ void netTask(void*) {
             checkForUpdate("boot");
         }
 
-        // Now link the Prime (WebSocket) and set up push-OTA.
+        // Clock no longer required (insecure OTA + plain-HTTP Prime link). Fire NTP
+        // best-effort for log timestamps only — no blocking wait, no HTTPS-Date TLS.
+        configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+
+        // Link the Prime (WebSocket) and set up push-OTA.
+        String host = resolveHost(c);
         snprintf(bootMsg, sizeof(bootMsg), "linking Prime");
         hr.onValueChanged(onValueChanged);
         hr.onConnection([](bool up) {
