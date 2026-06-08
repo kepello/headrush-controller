@@ -242,10 +242,10 @@ char libCurrentRigId[40] = "";
 char libCurrentSetlistName[40] = "";
 
 // Scroll-list Home state (Setlist / Rig knob types). turn scrolls the fetched
-// names; after a pause the highlighted item is loaded. UI-task-local.
-constexpr uint32_t LIST_COMMIT_MS = 600;    // pause before a scrolled item loads
+// names; single-click loads the highlight, 10 s idle reverts it. UI-task-local.
+constexpr uint32_t LIST_REVERT_MS = 10000;  // idle before a browsed highlight reverts to the loaded item
 int  listCursor = 0;
-int  listCommitted = -1;                    // last loaded index (avoids reloading)
+int  listCommitted = -1;                    // currently loaded index (browse previews away from it)
 uint32_t lastListScrollMs = 0;
 bool listLoading = false;
 bool listDirty = false;
@@ -1572,6 +1572,17 @@ void loop() {
         edelta = (v - lastEncoderValue) * ENCODER_SIGN;
         lastEncoderValue = v;
     }
+    // Velocity-based acceleration: the faster the detents arrive, the larger each
+    // step. Values get a stronger curve than list scrolling (so you don't blow
+    // past a rig). Creep stays 1:1 for precision. Tunable by feel.
+    int valAccel = 1, listAccel = 1;
+    if (edelta != 0) {
+        static uint32_t lastTurnMs = 0;
+        uint32_t dt = millis() - lastTurnMs;
+        lastTurnMs = millis();
+        if      (dt < 25) { valAccel = 12; listAccel = 6; }   // fast spin
+        else if (dt < 60) { valAccel = 4;  listAccel = 3; }   // moderate
+    }
     if (edelta != 0 || clicked || longPress) noteActivity();
     // No inactivity auto-return: a board stays on whatever screen it was left on.
 
@@ -1842,21 +1853,19 @@ void loop() {
         vTaskDelay(pdMS_TO_TICKS(10));
         return;
     }
-    // single-click steps to the next group member (no-op for a group of one).
-    if (singleClick && homeGroupLen > 1) {
+    // Double-click steps to the next group member (no-op for a group of one).
+    // (§3: single-click is now "load" on a list / nothing on a value; the member
+    // cycle moved here to free it.)
+    if (doubleClick && homeGroupLen > 1) {
         focusHomeMember(homeFocus + 1);
         lastRenderedValue = -999999.0f; lastTunerCents = -999.0f;
         vTaskDelay(pdMS_TO_TICKS(5));
         return;
     }
-    // double-click = the focused member's action: toggle the focused effect
-    // block's bypass (Phase 2 wires the real call). No-op for tuner/list types.
-    if (doubleClick && !tunerActive && !homeListActive) {
-        bypassToggleReq = true;
-    }
 
-    // --- Setlist / Rig scroll-list Home --- turn scrolls the names; after a
-    // brief pause the highlighted item is loaded (no click-to-select).
+    // --- Setlist / Rig browse-then-load Home (§3/§4) --- turn browses names with
+    // nothing loading; single-click loads the highlighted item; 10 s idle reverts
+    // the highlight to the loaded item. No more pause-to-load cascade.
     if (homeListActive) {
         bool isSet = viewIsSetlist(homeGroup[homeFocus]);
         if (libReqDone) {                 // a fetch/load finished: sync cursor to the loaded item
@@ -1886,12 +1895,16 @@ void loop() {
         }
         if (listCursor >= count) listCursor = count - 1;
         if (edelta != 0) {
-            listCursor = (((listCursor + edelta) % count) + count) % count;
+            listCursor = (((listCursor + edelta * listAccel) % count) + count) % count;
             lastListScrollMs = millis();
             listDirty = true;
         }
-        // Pause-commit: a moment after the last turn, load the highlighted item.
-        if (listCursor != listCommitted && (millis() - lastListScrollMs) > LIST_COMMIT_MS) {
+        // 10 s idle while browsed away from the loaded item -> revert (no load).
+        if (listCursor != listCommitted && (millis() - lastListScrollMs) > LIST_REVERT_MS) {
+            listCursor = listCommitted; listDirty = true;
+        }
+        // Single-click loads the highlighted item (only if it's a different one).
+        if (singleClick && listCursor != listCommitted) {
             listCommitted = listCursor;
             if (isSet) {
                 strncpy(libSelSetlistId, libSetlistIds[listCursor], sizeof(libSelSetlistId)); libSelSetlistId[39] = 0;
@@ -1908,6 +1921,7 @@ void loop() {
                 portEXIT_CRITICAL(&stateMux);
                 libLoadRigReq = true;
             }
+            listLoading = true; listDirty = true;
             noteActivity();
         }
         uint16_t sc = statusColor(connStatus);
@@ -1949,7 +1963,7 @@ void loop() {
 
     if (edelta != 0) {
         portENTER_CRITICAL(&stateMux);
-        float nv = sharedValue + edelta * activeBinding->step;
+        float nv = sharedValue + edelta * valAccel * activeBinding->step;
         if (nv < activeBinding->dispMin) nv = activeBinding->dispMin;
         if (nv > activeBinding->dispMax) nv = activeBinding->dispMax;
         sharedValue = nv;
