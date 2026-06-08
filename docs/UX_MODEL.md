@@ -22,51 +22,64 @@ Prime's own 3 macro encoders require crouching).
   (glove/dark-stage proof, one mental model). Do not add touch navigation
   without revisiting this spec.
 
-## 3. The universal gesture grammar (no exceptions, every screen)
+## 3. The gesture grammar
 
-| Gesture | Meaning |
-|---|---|
-| **Turn** | *Move*: change the focused value, or move the list cursor. Value edits are live (written to the Prime immediately). |
-| **Click** (short) | *Advance focus*: in a list, enter/select the highlighted item; on Home, cycle to the next control in the knob's group. |
-| **Double-click** | *Bypass* (Home only): toggle the focused effect control's block. No-op for globals/EQ/tuner/Setlist/Rig (nothing to bypass). |
-| **Hold** (~1 s) | *Back*: up one level. At a board's Home screen, "up" opens the Board Menu. |
+Revised 2026-06-07. The grammar is **per control type**: *turn* and *click* each
+do the natural thing for the focused control, and *double-click* / *hold* are
+universal. The unifying rule:
 
-Each gesture has exactly one meaning — no precedence rules. Turn never changes
-screens; single-click advances focus; double-click bypasses; hold leaves. This
-eliminates the prior inconsistencies (turn meaning "adjust" on dials but
-"navigate" in the Library; click meaning "cycle view" vs "select"). A board
-**stays on whatever screen it was left on** — there is no inactivity auto-return
-to Home (the screen still dims when idle).
+> **Turn interacts cheaply** — live-adjust a value, or move a highlight. **A
+> press is the only thing that causes anything destructive** — loading a rig,
+> flipping a block on/off.
 
-**Knob groups.** A board's Home can hold **one control or an ordered group** of
-related controls (e.g. `[Bass, Treble]`, a 3-band EQ, or several effect mixes
-when there aren't enough knobs for one each). Turn adjusts the focused member;
-single-click steps to the next member; double-click bypasses the focused
-member's block. The Home screen shows **one dot per group member** with the
-active member's dot highlighted (two members → two dots, etc.) — no "1/2" text.
-A group of one is just a single control (single-click is then a no-op).
+| Gesture | Continuous value | Toggle (on/off) | Rig / Setlist list |
+|---|---|---|---|
+| **Turn** | adjust **live** (written immediately), speed-sensitive | — *ignored* (a brushed knob can't flip it) | **browse** names — nothing loads, speed-sensitive |
+| **Click** | — | **flip On/Off** | **load** the highlighted item |
+| **Double-click** | next control in the dial's group | next control | next control |
+| **Hold** (~1 s, repeats) | up one level; keep holding climbs to the top | up one level | cancel browse → current item, then up a level |
+| **~10 s idle** (browsing a list) | — | — | revert the highlight to the loaded item (no load) |
+
+This replaces the earlier "turn always previews / pause-to-load" idea. Value
+knobs stay **instantly live** (the headline feature); only *lists* defer to a
+press, which removes the old failure where browsing rigs auto-loaded each one and
+spun the whole fleet. Double-click cycling has a built-in ~250 ms detect window,
+so a click acts after that — fine for load/flip, not used for live values.
+
+**Acceleration.** Turning *and* list-scrolling are velocity-sensitive: a slow
+creep moves 1 step / 1 item (precise); faster spins move in larger increments.
+Tunable by feel on hardware.
+
+**Toggles are a first-class control type.** A block's enable (`On`) and any other
+boolean param are assignable like a value — this is where "bypass" lives now,
+not a hidden gesture. On Home a toggle shows big **ON / OFF** (green / dim) and
+**click flips it**.
+
+**Knob groups.** A board's Home holds **one control or an ordered group**
+(e.g. `[Bass, Treble]`, or a Delay's `Mix` + its `Enable`, or several params of
+one device). Turn/click act on the focused member; **double-click** steps to the
+next; hold leaves. One dot per member, the active one highlighted.
 
 ## 4. Screen hierarchy (identical on all 4 boards)
 
 ```
 HOME  ─ this board's assigned control/group for the loaded rig
-│       a value dial, OR Tuner, OR a Rigs/Setlists readout
-│       turn = adjust · single-click = next member · double-click = member action · hold = Board Menu
+│       a value dial, a toggle, OR a Rigs/Setlists browser
+│       turn/click = per control type (§3) · double-click = next member · hold = Board Menu
 │
 └─ BOARD MENU            (hold from Home)
-   ├─ Assign this knob → …   multi-select from controls AVAILABLE IN THE LOADED RIG
-   │                          (dials, Tuner, Setlist, Rig — pick one or form an ordered group)
+   ├─ Assign this knob → …   build the dial's group (§5.1): This-dial / globals / rig devices → params
    └─ Settings →             device/global: ID, WiFi, firmware, mic strip, rename/save…
 ```
 
 **Control types are assignable, not menu destinations.** Tuner, **Setlist**, and
-**Rig** aren't fixed menu items — they're control *types* in the Assign list, so a
-knob can BE the setlist selector or rig selector (and can sit in a group with
-dials). **Setlist and Rig are scroll-to-select lists**: the Home screen shows the
-current item; **turn scrolls** the names and, after a brief pause (~0.6 s) on one,
-that item is **loaded** — no click-to-select, no drill-down, no back row. Single-
-click still cycles group members. (Rig scrolls the current setlist's rigs; Setlist
-scrolls all setlists and loading one switches the active setlist.)
+**Rig** aren't fixed menu items — they're control *types* you can assign to a
+knob (and group with others). **Setlist and Rig are browse-then-load lists**: the
+Home screen shows the loaded item; **turn browses** the names with *nothing
+loading*, and a **single click loads** the highlighted one (10 s idle reverts the
+highlight — no load). This is deliberate: browsing no longer cascades a rig load +
+fleet-wide re-resolve on every name. (Rig browses the current setlist's rigs;
+Setlist browses all setlists and loading one switches the active setlist.)
 
 ## 5. Per-rig dynamic layout (the core idea)
 
@@ -128,6 +141,31 @@ Chosen over central-on-Prime because:
 
 Tradeoff: a full USB reflash loses layouts (rare — OTA is the normal path).
 Optional future mitigation: export the layout blob to the OTA host as a backup.
+
+### 5.1 Assigning a dial (drill-in, toggle add/remove)
+
+Revised 2026-06-07. Building a dial's group is a two-level drill-in; adding and
+removing are the **same click-toggle**, so it's symmetric.
+
+**Level 1 — pick a source** (spinner + arc dots; turn browses, dots show what's in
+the group), in order:
+1. **This dial** — the group's current members, in order. Click one to **remove**
+   it directly (no drilling). (Later: reorder here.)
+2. **Globals / System** — Output, Input, Tempo, Width, Bass, Treble, Tuner,
+   Setlist, Rig. Single-value leaves: **click toggles** in/out of the group.
+3. **Rig devices** — grouped by **category, then name**. Click a device → Level 2.
+
+**Level 2 — pick the device's params:** the **primary** is pre-selected on top;
+turn for the others (its value params, its **Enable** toggle, and any boolean
+params). **Click toggles** that device+param in/out of the group — so one device
+can contribute **several** members (e.g. a Delay's `Mix` + `Feedback` + `Enable`).
+
+- **Selection feedback:** chosen items show in accent + the bright arc dot; a
+  Level-1 device dot is bright if **any** of its params are in the group, and its
+  row shows a count when more than one (`Multi Chorus ·2`).
+- **Back / commit:** hold or 10 s idle = up a level. **Hold at Level 1 commits**
+  the group (saves per-rig → re-resolve) and exits to the Board Menu.
+- The group's **order** is add order — what double-click cycles in operate.
 
 ## 6. Control catalog — curated now, discovery later
 
